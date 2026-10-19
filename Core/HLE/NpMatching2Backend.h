@@ -17,13 +17,15 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 
 // The "server side" of sceNpMatching2. sceNp2.cpp deals with PSP memory, request ids and callbacks;
 // a backend only answers the requests. The fake backend answers locally with one server and one world,
-// which is enough to get through a game's server select. A network backend can replace it later.
+// which is enough to get through a game's server select and to host a room alone. A network backend
+// (a server holding shared room state) can replace it later.
 
 struct NpMatching2ServerInfo {
 	u16 serverId;
@@ -39,6 +41,43 @@ struct NpMatching2WorldInfo {
 	u32 curNumOfTotalRoomMember;
 };
 
+struct NpMatching2RoomMember {
+	u16 memberId;  // 1-based, unique in the room
+	std::string onlineId;
+	u64 joinDate;  // RTC ticks
+	u32 flagAttr;
+};
+
+struct NpMatching2Room {
+	u16 serverId;
+	u32 worldId;
+	u64 lobbyId;
+	u64 roomId;
+	u32 maxSlot;
+	u32 flagAttr;
+	u16 ownerMemberId;
+	u16 myMemberId;
+	std::vector<NpMatching2RoomMember> members;
+};
+
+// The parts of SceNpMatching2CreateJoinRoomRequest the backend needs.
+struct NpMatching2CreateJoinRoomParams {
+	u16 serverId;
+	u32 worldId;
+	u64 lobbyId;
+	u32 maxSlot;
+	u32 flagAttr;
+};
+
+struct NpMatching2SearchRoomParams {
+	u32 worldId;
+	u64 lobbyId;
+	u32 startIndex;  // 1-based
+	u32 max;
+	u32 flagFilter;
+	u32 flagAttr;
+};
+
 class NpMatching2Backend {
 public:
 	virtual ~NpMatching2Backend() {}
@@ -51,6 +90,14 @@ public:
 	// Request functions return 0 or an error code. The error goes to the game's request callback.
 	virtual int GetServerInfo(u16 serverId, NpMatching2ServerInfo *info) = 0;
 	virtual int GetWorldInfoList(u16 serverId, std::vector<NpMatching2WorldInfo> *worlds) = 0;
+
+	// Rooms. The attribute blobs and filters are not passed through yet.
+	virtual int SearchRoom(const NpMatching2SearchRoomParams &params, std::vector<NpMatching2Room> *rooms, u32 *total) = 0;
+	virtual int CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, NpMatching2Room *room) = 0;
+	virtual int LeaveRoom(u64 roomId) = 0;
+	virtual int SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr) = 0;
+	virtual int SetRoomDataExternal(u64 roomId) = 0;
+	virtual int SendRoomMessage(u64 roomId) = 0;
 };
 
 NpMatching2Backend &GetNpMatching2Backend();

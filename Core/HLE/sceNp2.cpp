@@ -51,6 +51,12 @@ struct NpMatching2Request {
 static std::deque<NpMatching2Request> npMatching2Requests;
 static u32 npMatching2NextReqId = 1;
 
+// The room we're in (0 = none), and the per-room callbacks from CreateJoinRoom/JoinRoom:
+// {u32 cbFunc; u32 cbArg; ...}. Room events and room messages aren't sent yet (nobody else can join).
+static u64 npMatching2RoomId = 0;
+static u32 npMatching2RoomEventCb = 0, npMatching2RoomEventCbArg = 0;
+static u32 npMatching2RoomMessageCb = 0, npMatching2RoomMessageCbArg = 0;
+
 // Response data for request callbacks lives in PSP memory. It only has to stay valid while the callback
 // runs, so a small ring of slots is enough. TODO: savestates.
 static const u32 NP_MATCHING2_DATA_SLOT_SIZE = 0x400;
@@ -174,6 +180,7 @@ static int sceNpMatching2Init(int poolSize, int threadPriority, int cpuAffinityM
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
 	npMatching2Requests.clear();
+	npMatching2RoomId = 0;
 	npMatching2Inited = true;
 	INFO_LOG(Log::sceNet, "NpMatching2 backend: %s", GetNpMatching2Backend().Name());
 	return 0;
@@ -479,115 +486,221 @@ static int sceNpMatching2GetUserInfoList(int ctxId, u32 reqParamPtr, u32 optPara
 	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0004);
 }
 
+// PSP SceNpMatching2RoomMemberDataInternal, as PSP2i reads it: next @0, SceNpId @4, onlineName ptr @0x28,
+// memberId u16 @0x38. joinDate @0x30 and flagAttr @0x3C follow the PS3 order but are unverified.
+static const u32 NP_MATCHING2_ROOM_MEMBER_SIZE = 0x50;
+// PSP SceNpMatching2RoomDataInternal: same layout as the PS3 one (PSP2i reads roomId @0x10 and the member
+// list @0x24..0x30).
+static const u32 NP_MATCHING2_ROOM_DATA_INTERNAL_SIZE = 0x48;
+
+// Writes the room at addr, followed by its members. Returns false if it doesn't fit in size.
+static bool NpMatching2WriteRoomDataInternal(u32 addr, u32 size, const NpMatching2Room &room) {
+	const u32 membersAddr = addr + NP_MATCHING2_ROOM_DATA_INTERNAL_SIZE;
+	if (NP_MATCHING2_ROOM_DATA_INTERNAL_SIZE + room.members.size() * NP_MATCHING2_ROOM_MEMBER_SIZE > size)
+		return false;
+
+	u32 meAddr = 0, ownerAddr = 0;
+	for (size_t i = 0; i < room.members.size(); i++) {
+		const NpMatching2RoomMember &member = room.members[i];
+		const u32 m = membersAddr + (u32)i * NP_MATCHING2_ROOM_MEMBER_SIZE;
+		SceNpId npId{};
+		if (member.memberId == room.myMemberId)
+			NpGetNpId(&npId);
+		memset(&npId.handle, 0, sizeof(npId.handle));
+		memcpy(npId.handle.data, member.onlineId.data(), std::min(member.onlineId.size(), sizeof(npId.handle.data)));
+		Memory::Write_U32(i + 1 < room.members.size() ? m + NP_MATCHING2_ROOM_MEMBER_SIZE : 0, m);
+		Memory::Memcpy(m + 0x04, &npId, sizeof(npId), "NpMatching2RoomMember");
+		Memory::Write_U32(m + 0x04, m + 0x28);  // onlineName -> the handle inside npId
+		Memory::Write_U64(member.joinDate, m + 0x30);
+		Memory::Write_U16(member.memberId, m + 0x38);
+		Memory::Write_U32(member.flagAttr, m + 0x3C);
+		if (member.memberId == room.myMemberId)
+			meAddr = m;
+		if (member.memberId == room.ownerMemberId)
+			ownerAddr = m;
+	}
+
+	Memory::Write_U16(room.serverId, addr + 0x00);
+	Memory::Write_U32(room.worldId, addr + 0x04);
+	Memory::Write_U64(room.lobbyId, addr + 0x08);
+	Memory::Write_U64(room.roomId, addr + 0x10);
+	Memory::Write_U64(0, addr + 0x18);  // passwordSlotMask
+	Memory::Write_U32(room.maxSlot, addr + 0x20);
+	Memory::Write_U32(room.members.empty() ? 0 : membersAddr, addr + 0x24);
+	Memory::Write_U32((u32)room.members.size(), addr + 0x28);
+	Memory::Write_U32(meAddr, addr + 0x2C);
+	Memory::Write_U32(ownerAddr, addr + 0x30);
+	Memory::Write_U32(0, addr + 0x34);  // roomGroup
+	Memory::Write_U32(0, addr + 0x38);  // roomGroupNum
+	Memory::Write_U32(room.flagAttr, addr + 0x3C);
+	Memory::Write_U32(0, addr + 0x40);  // roomBinAttrInternal
+	Memory::Write_U32(0, addr + 0x44);  // roomBinAttrInternalNum
+	return true;
+}
+
+// Request functions on the room we're in: the reqParam starts with the u64 roomId. On success the
+// callback gets a zeroed response (the games we know don't read it).
+static int NpMatching2SimpleRoomRequest(const char *name, int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr, u32 event, int (NpMatching2Backend::*op)(u64))
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 8) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	const u64 roomId = Memory::Read_U64(reqParamPtr);
+	int err = (GetNpMatching2Backend().*op)(roomId);
+	u32 data = 0;
+	if (err >= 0 && !(data = NpMatching2AllocResponse()))
+		err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, event, err, data);
+	return hleLogInfo(Log::sceNet, 0, "%s: roomId=%llu -> reqId=%d, error=%08x", name, (unsigned long long)roomId, reqId, err);
+}
+
 static int sceNpMatching2SetRoomDataExternal(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0006);
+	// TODO: pass the searchable/bin attributes to the backend.
+	return NpMatching2SimpleRoomRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0006, &NpMatching2Backend::SetRoomDataExternal);
 }
 
 static int sceNpMatching2SendRoomMessage(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0108);
+	// TODO: pass castType/destination/payload to the backend.
+	return NpMatching2SimpleRoomRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0108, &NpMatching2Backend::SendRoomMessage);
 }
 
+// reqParam = {u64 roomId; u32 flagFilter; u32 flagAttr; ...} (PSP2i).
+static int sceNpMatching2SetRoomDataInternal(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x10) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	const u64 roomId = Memory::Read_U64(reqParamPtr);
+	const u32 flagFilter = Memory::Read_U32(reqParamPtr + 8);
+	const u32 flagAttr = Memory::Read_U32(reqParamPtr + 12);
+	int err = GetNpMatching2Backend().SetRoomDataInternal(roomId, flagFilter, flagAttr);
+	u32 data = 0;
+	if (err >= 0 && !(data = NpMatching2AllocResponse()))
+		err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0109, err, data);
+	return hleLogInfo(Log::sceNet, 0, "roomId=%llu flagFilter=%08x flagAttr=%08x -> reqId=%d, error=%08x", (unsigned long long)roomId, flagFilter, flagAttr, reqId, err);
+}
+
+// reqParam = {u64 roomId; u8 optData[0x14]...}.
 static int sceNpMatching2LeaveRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	ERROR_LOG(Log::sceNet, "UNIMPL %s(%d, %08x, %08x, %08x[%08x]) at %08x", __FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, Memory::Read_U32(assignedReqIdPtr), currentMIPS->pc);
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-
-	if (!Memory::IsValidAddress(reqParamPtr) || !Memory::IsValidAddress(assignedReqIdPtr))
+	if (!Memory::IsValidRange(reqParamPtr, 8) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	u32 cbFunc = Memory::Read_U32(reqParamPtr);
-	u32 cbArg = Memory::Read_U32(reqParamPtr + 0x04);
-
-	// Notify callback handler
-	if (Memory::IsValidAddress(cbFunc)) {
-		// There args are supposed to be constructed in the stack and the data need to be available even after returning from this function, so these args + optional data probably copied to somewhere
-		NpMatching2Args args = {};
-		args.data[0] = PSP_NP_MATCHING2_EVENT_0103;
-		args.data[1] = PSP_NP_MATCHING2_STATE_3202;
-		//args.data[2] = pointer to arg[8], where the 1st 20 bytes copied from (reqParamPtr+0x08), the rest of the struct are zeroed
-		args.data[3] = optParamPtr;
-		args.data[4] = 0;
-		args.data[5] = assignedReqIdPtr;
-		args.data[6] = 0;
-		//args.data[8] = an initially zeroed struct of 536 bytes where the 1st 20 bytes were taken from reqParam offset 0x08
-
-		notifyNpMatching2Handlers(args, ctxId, 0, cbFunc, cbArg, 0, 0, 0, 0x0c);
-
-		Memory::Write_U32(args.data[1], assignedReqIdPtr);
+	const u64 roomId = Memory::Read_U64(reqParamPtr);
+	int err = GetNpMatching2Backend().LeaveRoom(roomId);
+	if (err >= 0 && roomId == npMatching2RoomId) {
+		npMatching2RoomId = 0;
+		npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
 	}
-
-	// After returning, Fat Princess will loop for 64 times (increasing the address by 288 bytes on each loop) or until found a zero status byte (0x08BD4860 + 0x10), looking for empty/available entry to set?
-	return 0;
+	u32 data = 0;
+	if (err >= 0 && !(data = NpMatching2AllocResponse()))
+		err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0103, err, data);
+	return hleLogInfo(Log::sceNet, 0, "roomId=%llu -> reqId=%d, error=%08x", (unsigned long long)roomId, reqId, err);
 }
 
-static int sceNpMatching2CreateJoinRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 unknown1, u32 unknown2, u32 assignedReqIdPtr)
+// (ctxId, reqParam, optParam, roomEventCbParam, roomMessageCbParam, &assignedReqId), checked against PSP2i.
+// reqParam (0x70 bytes) follows the PS3 SceNpMatching2CreateJoinRoomRequest: worldId @0, lobbyId u64 @8,
+// maxSlot @0x10, flagAttr @0x14, then attribute/password/group pointers. The callback data is
+// {SceNpMatching2RoomDataInternal *roomDataInternal}.
+static int sceNpMatching2CreateJoinRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 roomEventCbParamPtr, u32 roomMessageCbParamPtr, u32 assignedReqIdPtr)
 {
-	ERROR_LOG(Log::sceNet, "UNIMPL %s(%d, %08x, %08x, %08x[%08x]) at %08x", __FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, Memory::Read_U32(assignedReqIdPtr), currentMIPS->pc);
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-
-	if (!Memory::IsValidAddress(reqParamPtr) || !Memory::IsValidAddress(assignedReqIdPtr))
+	if (!Memory::IsValidRange(reqParamPtr, 0x18) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	// Server ID is a 16-bit variable according to JPCSP
-	int serverId = Memory::Read_U16(reqParamPtr + 0x06);
+	NpMatching2CreateJoinRoomParams params{};
+	params.serverId = GetNpMatching2Backend().GetServerIdList().empty() ? 0 : GetNpMatching2Backend().GetServerIdList()[0];
+	params.worldId = Memory::Read_U32(reqParamPtr + 0x00);
+	params.lobbyId = Memory::Read_U64(reqParamPtr + 0x08);
+	params.maxSlot = Memory::Read_U32(reqParamPtr + 0x10);
+	params.flagAttr = Memory::Read_U32(reqParamPtr + 0x14);
+	if (params.worldId == 0)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT, "worldId 0");
 
-	if (serverId == 0)
-		return hleLogError(Log::sceNet, 0x80550CBF); // Should be SCE_NP_MATCHING2_ERROR_INVALID_SERVER_ID ?
+	SceNpId myNpId{};
+	NpGetNpId(&myNpId);
+	const std::string myOnlineId(myNpId.handle.data, strnlen(myNpId.handle.data, sizeof(myNpId.handle.data)));
 
-	u32 cbFunc = Memory::Read_U32(reqParamPtr);
-	u32 cbArg = Memory::Read_U32(reqParamPtr + 0x04);
-
-	// Notify callback handler
-	if (Memory::IsValidAddress(cbFunc)) {
-		// There args are supposed to be constructed in the stack and the data need to be available even after returning from this function, so these args + optional data probably copied to somewhere
-		NpMatching2Args args = {};
-		args.data[0] = PSP_NP_MATCHING2_EVENT_0102;
-		args.data[1] = PSP_NP_MATCHING2_STATE_1209;
-		//args.data[2] = pointer to arg[8] (optional data?)
-		args.data[3] = optParamPtr;
-		args.data[4] = 0;
-		args.data[5] = assignedReqIdPtr;
-		args.data[6] = 0;
-		// Followed by optional data?
-		args.data[8] = reqParamPtr; // an initially zeroed struct of 1224 bytes, where the 1st 32bit is set to reqParamPtr
-		args.data[9] = unknown1;
-		args.data[10] = unknown2;
-
-		notifyNpMatching2Handlers(args, ctxId, serverId, 0, 0, 0, 0, 1, 0x0a);
-
-		Memory::Write_U32(args.data[1], assignedReqIdPtr);
+	NpMatching2Room room{};
+	int err = GetNpMatching2Backend().CreateJoinRoom(params, myOnlineId, &room);
+	u32 data = 0;
+	if (err >= 0) {
+		data = NpMatching2AllocResponse();
+		if (data && NpMatching2WriteRoomDataInternal(data + 0x10, NP_MATCHING2_DATA_SLOT_SIZE - 0x10, room)) {
+			Memory::Write_U32(data + 0x10, data);
+			npMatching2RoomId = room.roomId;
+			if (Memory::IsValidRange(roomEventCbParamPtr, 8)) {
+				npMatching2RoomEventCb = Memory::Read_U32(roomEventCbParamPtr);
+				npMatching2RoomEventCbArg = Memory::Read_U32(roomEventCbParamPtr + 4);
+			}
+			if (Memory::IsValidRange(roomMessageCbParamPtr, 8)) {
+				npMatching2RoomMessageCb = Memory::Read_U32(roomMessageCbParamPtr);
+				npMatching2RoomMessageCbArg = Memory::Read_U32(roomMessageCbParamPtr + 4);
+			}
+		} else {
+			err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+		}
 	}
 
-	// After returning, Fat Princess will loop for 64 times (increasing the address by 288 bytes on each loop) or until found a zero status byte (0x08BD4860 + 0x10), looking for empty/available entry to set?
-	return 0;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0101, err, data);
+	return hleLogInfo(Log::sceNet, 0, "world=%u maxSlot=%u flagAttr=%08x -> roomId=%llu, reqId=%d, error=%08x, roomEventCb=%08x, roomMessageCb=%08x",
+		params.worldId, params.maxSlot, params.flagAttr, (unsigned long long)room.roomId, reqId, err, npMatching2RoomEventCb, npMatching2RoomMessageCb);
 }
 
+// reqParam (0x38 bytes) follows the PS3 SceNpMatching2SearchRoomRequest: option @0, worldId @4,
+// lobbyId u64 @8, rangeFilter {startIndex, max} @0x10, flagFilter @0x18, flagAttr @0x1C, then the
+// int/bin filters and attribute ids. The callback data is
+// {u32 startIndex; u32 total; u32 resultCount; SceNpMatching2RoomDataExternal *rooms}.
 static int sceNpMatching2SearchRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	ERROR_LOG(Log::sceNet, "UNIMPL %s(%d, %08x, %08x, %08x[%08x]) at %08x", __FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, Memory::Read_U32(assignedReqIdPtr), currentMIPS->pc);
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-
-	if (!Memory::IsValidAddress(reqParamPtr) || !Memory::IsValidAddress(assignedReqIdPtr))
+	if (!Memory::IsValidRange(reqParamPtr, 0x38) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	u32 cbFunc = Memory::Read_U32(reqParamPtr);
-	u32 cbArg = Memory::Read_U32(reqParamPtr + 0x04);
+	NpMatching2SearchRoomParams params{};
+	params.worldId = Memory::Read_U32(reqParamPtr + 0x04);
+	params.lobbyId = Memory::Read_U64(reqParamPtr + 0x08);
+	params.startIndex = Memory::Read_U32(reqParamPtr + 0x10);
+	params.max = Memory::Read_U32(reqParamPtr + 0x14);
+	params.flagFilter = Memory::Read_U32(reqParamPtr + 0x18);
+	params.flagAttr = Memory::Read_U32(reqParamPtr + 0x1C);
 
-	// Notify callback handler
-	if (Memory::IsValidAddress(cbFunc)) {
-		// There args are supposed to be constructed in the stack and the data need to be available even after returning from this function, so these args + optional data probably copied to somewhere
-		NpMatching2Args args = {};
-		// TODO: Set the correct callback args
-
-		Memory::Write_U32(args.data[1], assignedReqIdPtr); // server status or flags?
+	std::vector<NpMatching2Room> rooms;
+	u32 total = 0;
+	int err = GetNpMatching2Backend().SearchRoom(params, &rooms, &total);
+	u32 data = 0;
+	if (err >= 0) {
+		if (!rooms.empty()) {
+			// TODO: write SceNpMatching2RoomDataExternal entries (PSP2i: next @0, roomId @0x18, owner @0x30).
+			WARN_LOG(Log::sceNet, "%s: %d room(s) from the backend dropped, RoomDataExternal isn't implemented", __FUNCTION__, (int)rooms.size());
+			total = 0;
+		}
+		data = NpMatching2AllocResponse();
+		if (data) {
+			Memory::Write_U32(params.startIndex ? params.startIndex : 1, data);
+			Memory::Write_U32(total, data + 4);
+			Memory::Write_U32(0, data + 8);  // resultCount
+			Memory::Write_U32(0, data + 12);
+		} else {
+			err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+		}
 	}
 
-	return 0;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0106, err, data);
+	return hleLogInfo(Log::sceNet, 0, "world=%u range=%u+%u flags=%08x/%08x -> reqId=%d, %u room(s), error=%08x",
+		params.worldId, params.startIndex, params.max, params.flagFilter, params.flagAttr, reqId, total, err);
 }
 
 static int sceNpMatching2SendRoomChatMessage(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
@@ -644,7 +757,7 @@ const HLEFunction sceNpMatching2[] = {
 	{0x7BBFC427, nullptr,		                                        "sceNpMatching2JoinRoom",			            'i', ""       },
 	{0x97529ECC, nullptr,		                                        "sceNpMatching2KickoutRoomMember",			    'i', ""       },
 	{0xA53E7C69, &WrapI_IUUU<sceNpMatching2GetWorldInfoList>,			"sceNpMatching2GetWorldInfoList",			    'i', "ixxx"   },
-	{0xE6C93DBD, nullptr,		                                        "sceNpMatching2SetRoomDataInternal",			'i', ""       },
+	{0xE6C93DBD, &WrapI_IUUU<sceNpMatching2SetRoomDataInternal>,		"sceNpMatching2SetRoomDataInternal",			'i', "ixxx"   },
 	{0xFADBA9DB, &WrapI_IU<sceNpMatching2AbortRequest>,					"sceNpMatching2AbortRequest",			        'i', "ix"     },
 	{0xC8FC5D41, &WrapI_IUUU<sceNpMatching2GetUserInfoList>,			"sceNpMatching2GetUserInfoList",				'i', "ixxx"   },
 	{0xD7D4AEB2, &WrapI_IUUU<sceNpMatching2SetRoomDataExternal>,		"sceNpMatching2SetRoomDataExternal",			'i', "ixxx"   },

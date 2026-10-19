@@ -21,10 +21,12 @@
 #include "Common/Swap.h"
 #include "Core/HLE/NpMatching2Backend.h"
 #include "Core/HLE/sceNp2.h"
+#include "Core/HLE/sceRtc.h"
 
 namespace {
 
-// Answers locally: one server, available, with one world. No other players.
+// Answers locally: one server, available, with one world. No other players: searches find nothing, and a
+// created room only ever holds the local player, as its owner.
 class FakeNpMatching2Backend : public NpMatching2Backend {
 public:
 	const char *Name() const override { return "fake"; }
@@ -55,7 +57,50 @@ public:
 		return 0;
 	}
 
+	int SearchRoom(const NpMatching2SearchRoomParams &params, std::vector<NpMatching2Room> *rooms, u32 *total) override {
+		*total = 0;
+		return 0;
+	}
+
+	int CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, NpMatching2Room *room) override {
+		room->serverId = params.serverId;
+		room->worldId = params.worldId;
+		room->lobbyId = params.lobbyId;
+		room->roomId = nextRoomId_++;
+		room->maxSlot = params.maxSlot;
+		room->flagAttr = params.flagAttr;
+		room->ownerMemberId = 1;
+		room->myMemberId = 1;
+		room->members = { { 1, myOnlineId, __RtcGetCurrentTick(), 0 } };
+		currentRoomId_ = room->roomId;
+		INFO_LOG(Log::sceNet, "NpMatching2 (fake): created room %llu in world %u, maxSlot %u", (unsigned long long)room->roomId, params.worldId, params.maxSlot);
+		return 0;
+	}
+
+	int LeaveRoom(u64 roomId) override {
+		if (roomId != currentRoomId_)
+			return SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+		currentRoomId_ = 0;
+		return 0;
+	}
+
+	int SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr) override {
+		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	}
+
+	int SetRoomDataExternal(u64 roomId) override {
+		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	}
+
+	int SendRoomMessage(u64 roomId) override {
+		// Nobody else is in the room.
+		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	}
+
 private:
+	u64 nextRoomId_ = 1;
+	u64 currentRoomId_ = 0;
+
 	static constexpr u16 SERVER_ID = 1;
 	static constexpr u32 WORLD_ID = 1;
 };
