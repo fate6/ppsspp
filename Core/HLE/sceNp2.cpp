@@ -22,9 +22,11 @@
 #include "Core/CoreTiming.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/FunctionWrappers.h"
+#include "Core/HLE/sceKernelMemory.h"
 #include "Core/HLE/sceNet.h"
 #include "Core/HLE/sceNp.h"
 #include "Core/HLE/sceNp2.h"
+#include "Core/HLE/NpMatching2Backend.h"
 
 bool npMatching2Inited = false;
 SceNpAuthMemoryStat npMatching2MemStat = {};
@@ -33,6 +35,75 @@ std::recursive_mutex npMatching2EvtMtx;
 std::deque<NpMatching2Args> npMatching2Events;
 std::map<int, NpMatching2Handler> npMatching2Handlers;
 //std::map<int, NpMatching2Context> npMatching2Contexts;
+
+// Request functions take (ctxId, reqParam, optParam, &assignedReqId). optParam is
+// SceNpMatching2RequestOptParam {u32 cbFunc; u32 cbArg; u32 timeout; u16 appReqId;}, and the result is
+// delivered later as cbFunc(ctxId, reqId, event, errorCode, data, cbArg) (checked against PSP2i).
+struct NpMatching2Request {
+	u32 cbFunc;
+	u32 cbArg;
+	u32 ctxId;
+	u32 reqId;
+	u32 event;
+	u32 errorCode;
+	u32 dataAddr;
+};
+static std::deque<NpMatching2Request> npMatching2Requests;
+static u32 npMatching2NextReqId = 1;
+
+// Response data for request callbacks lives in PSP memory. It only has to stay valid while the callback
+// runs, so a small ring of slots is enough. TODO: savestates.
+static const u32 NP_MATCHING2_DATA_SLOT_SIZE = 0x400;
+static const int NP_MATCHING2_DATA_SLOTS = 16;
+static u32 npMatching2DataAddr = 0;
+static int npMatching2NextDataSlot = 0;
+
+static u32 NpMatching2AllocResponse() {
+	if (!npMatching2DataAddr) {
+		u32 size = NP_MATCHING2_DATA_SLOT_SIZE * NP_MATCHING2_DATA_SLOTS;
+		npMatching2DataAddr = kernelMemory.Alloc(size, true, "NpMatching2Data");
+		if (npMatching2DataAddr == (u32)-1) {
+			npMatching2DataAddr = 0;
+			return 0;
+		}
+	}
+	const u32 addr = npMatching2DataAddr + npMatching2NextDataSlot * NP_MATCHING2_DATA_SLOT_SIZE;
+	npMatching2NextDataSlot = (npMatching2NextDataSlot + 1) % NP_MATCHING2_DATA_SLOTS;
+	Memory::Memset(addr, 0, NP_MATCHING2_DATA_SLOT_SIZE, "NpMatching2Data");
+	return addr;
+}
+
+static void NpMatching2FreeResponses() {
+	if (npMatching2DataAddr) {
+		kernelMemory.Free(npMatching2DataAddr);
+		npMatching2DataAddr = 0;
+	}
+	npMatching2NextDataSlot = 0;
+}
+
+// Assigns a request id and queues the callback (if the game gave one). Returns the request id.
+static u32 NpMatching2QueueRequest(int ctxId, u32 optParamPtr, u32 assignedReqIdPtr, u32 event, s32 errorCode, u32 dataAddr) {
+	const u32 reqId = npMatching2NextReqId++;
+	if (npMatching2NextReqId == 0)
+		npMatching2NextReqId = 1;
+	if (Memory::IsValidRange(assignedReqIdPtr, 4))
+		Memory::Write_U32(reqId, assignedReqIdPtr);
+
+	u32 cbFunc = 0, cbArg = 0;
+	if (Memory::IsValidRange(optParamPtr, 8)) {
+		cbFunc = Memory::Read_U32(optParamPtr);
+		cbArg = Memory::Read_U32(optParamPtr + 4);
+	}
+	if (!Memory::IsValidAddress(cbFunc)) {
+		// TODO: fall back to the context's default request callback, once we track contexts.
+		WARN_LOG(Log::sceNet, "NpMatching2: request %d (event %04x) has no callback", reqId, event);
+		return reqId;
+	}
+
+	std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);
+	npMatching2Requests.push_back({ cbFunc, cbArg, (u32)ctxId, reqId, event, (u32)errorCode, dataAddr });
+	return reqId;
+}
 
 
 // serverId: 0 on 0x0103/0x0104/0x0105/0x0107/0x0108/0x0109/0x010a/0x010b/0x010c/0x010d (ie. when already joined to a server?)
@@ -50,6 +121,16 @@ void notifyNpMatching2Handlers(NpMatching2Args &args, u32 ctxId, u32 serverId, u
 }
 
 bool NpMatching2ProcessEvents() {
+	if (!npMatching2Requests.empty()) {
+		const NpMatching2Request req = npMatching2Requests.front();
+		npMatching2Requests.pop_front();
+		const u32 args[6] = { req.ctxId, req.reqId, req.event, req.errorCode, req.dataAddr, req.cbArg };
+		INFO_LOG(Log::sceNet, "NpMatching2 request callback %08x(ctx=%d, req=%d, event=%04x, error=%08x, data=%08x, arg=%08x)",
+			req.cbFunc, req.ctxId, req.reqId, req.event, req.errorCode, req.dataAddr, req.cbArg);
+		hleEnqueueCall(req.cbFunc, 6, args);
+		return true;
+	}
+
 	if (npMatching2Events.empty()) {
 		return false;
 	}
@@ -92,7 +173,9 @@ static int sceNpMatching2Init(int poolSize, int threadPriority, int cpuAffinityM
 
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
+	npMatching2Requests.clear();
 	npMatching2Inited = true;
+	INFO_LOG(Log::sceNet, "NpMatching2 backend: %s", GetNpMatching2Backend().Name());
 	return 0;
 }
 
@@ -102,6 +185,8 @@ static int sceNpMatching2Term()
 	npMatching2Inited = false;
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
+	npMatching2Requests.clear();
+	NpMatching2FreeResponses();
 
 	return 0;
 }
@@ -157,109 +242,13 @@ static int sceNpMatching2ContextStart(int ctxId)
 
 	// TODO: use sceNpGetUserProfile and check server availability using sceNpService_76867C01
 	//npMatching2Ctx.started = true;
-	Url url("http://static-resource.np.community.playstation.net/np/resource/psp-title/" + std::string(npTitleId.data) + "_00/matching/" + std::string(npTitleId.data) + "_00-matching.xml");
-	http::Client client(&ProcessHostnameWithInfraDNS);
-	bool cancelled = false;
-	net::RequestProgress progress(&cancelled);
-	if (!client.Resolve(url.Host().c_str(), url.Port())) {
-		return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "HTTP failed to resolve %s", url.Resource().c_str());
-	}
-
-	client.SetDataTimeout(20.0);
-	if (client.Connect()) {
-		char requestHeaders[4096];
-		snprintf(requestHeaders, sizeof(requestHeaders),
-			"User-Agent: PS3Community-agent/1.0.0 libhttp/1.0.0\r\n");
-
-		DEBUG_LOG(Log::sceNet, "GET URI: %s", url.ToString().c_str());
-		http::RequestParams req(url.Resource(), "*/*");
-		int err = client.SendRequest("GET", req, requestHeaders, &progress);
-		if (err < 0) {
-			client.Disconnect();
-			return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "HTTP GET Error = %d", err);
-		}
-
-		net::Buffer readbuf;
-		std::vector<std::string> responseHeaders;
-		int code = client.ReadResponseHeaders(&readbuf, responseHeaders, &progress);
-		if (code != 200) {
-			client.Disconnect();
-			return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "HTTP Error Code = %d", code);
-		}
-
-		net::Buffer output;
-		int res = client.ReadResponseEntity(&readbuf, responseHeaders, &output, &progress);
-		if (res != 0) {
-			WARN_LOG(Log::sceNet, "Unable to read HTTP response entity: %d", res);
-		}
-		client.Disconnect();
-
-		std::string entity;
-		size_t readBytes = output.size();
-		output.Take(readBytes, &entity);
-
-		// TODO: Use XML Parser to get the Tag and it's attributes instead of searching for keywords on the string
-		std::string text;
-		size_t ofs = entity.find("titleid=");
-		if (ofs == std::string::npos) 
-			return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "titleid not found");
-
-		ofs += 9;
-		size_t ofs2 = entity.find('"', ofs);
-		text = entity.substr(ofs, ofs2-ofs);
-		INFO_LOG(Log::sceNet, "%s - Title ID: %s", __FUNCTION__, text.c_str());
-
-		int i = 1;
-		while (true) {
-			ofs = entity.find("<agent-fqdn", ++ofs2);
-			if (ofs == std::string::npos) {
-				if (i == 1)
-					return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "agent-fqdn not found");
-				else
-					break;
-			}
-
-			size_t frontPos = ++ofs;
-			ofs = entity.find("id=", frontPos);
-			if (ofs == std::string::npos)
-				return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "agent id not found");
-
-			ofs += 4;
-			ofs2 = entity.find('"', ofs);
-			text = entity.substr(ofs, ofs2 - ofs);
-			INFO_LOG(Log::sceNet, "%s - Agent-FQDN#%d ID: %s", __FUNCTION__, i, text.c_str());
-
-			ofs = entity.find("port=", frontPos);
-			if (ofs == std::string::npos)
-				return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "agent port not found");
-
-			ofs += 6;
-			ofs2 = entity.find('"', ofs);
-			text = entity.substr(ofs, ofs2 - ofs);
-			INFO_LOG(Log::sceNet, "%s - Agent-FQDN#%d Port: %s", __FUNCTION__, i, text.c_str());
-
-			ofs = entity.find("status=", frontPos);
-			if (ofs == std::string::npos)
-				return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "agent status not found");
-
-			ofs += 8;
-			ofs2 = entity.find('"', ofs);
-			text = entity.substr(ofs, ofs2 - ofs);
-			INFO_LOG(Log::sceNet, "%s - Agent-FQDN#%d Status: %s", __FUNCTION__, i, text.c_str());
-
-			ofs = entity.find('>', ++ofs2);
-			if (ofs == std::string::npos)
-				return hleLogError(Log::sceNet, SCE_NP_COMMUNITY_SERVER_ERROR_NO_SUCH_TITLE, "agent host not found");
-
-			ofs2 = entity.find("</agent-fqdn", ++ofs);
-			text = entity.substr(ofs, ofs2 - ofs);
-			INFO_LOG(Log::sceNet, "%s - Agent-FQDN#%d Host: %s", __FUNCTION__, i, text.c_str());
-
-			i++;
-		}
-	}
-	hleEatMicro(1000000);
-	// Returning 0x805508A6 (error code inherited from sceNpService_76867C01 which check server availability) if can't check server availability (ie. Fat Princess (US) through http://static-resource.np.community.playstation.net/np/resource/psp-title/NPWR00670_00/matching/NPWR00670_00-matching.xml using User-Agent: "PS3Community-agent/1.0.0 libhttp/1.0.0")
+	// Upstream fetched http://static-resource.np.community.playstation.net/np/resource/psp-title/<commId>_00/matching/<commId>_00-matching.xml
+	// here, only to log the agent FQDNs it lists (blocking for up to 20 s). The backend decides now.
+	// Real firmware returns 0x805508A6 (from sceNpService_76867C01) if it can't check server availability.
+	int err = GetNpMatching2Backend().ContextStart(npTitleId.data);
+	if (err < 0)
+		return hleLogError(Log::sceNet, err);
+	hleEatMicro(1000);
 	return 0;
 }
 
@@ -372,74 +361,132 @@ static int sceNpMatching2GetServerIdListLocal(int ctxId, u32 serverIdsPtr, int m
 	if (!Memory::IsValidAddress(serverIdsPtr))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
 
-	// Returning dummy Id, a 16-bit variable according to JPCSP
-	for (int i = 0; i < maxServerIds; i++)
-		Memory::Write_U16(1234+i, serverIdsPtr+(i*2));
+	// Server ids are 16-bit according to JPCSP
+	const std::vector<u16> ids = GetNpMatching2Backend().GetServerIdList();
+	int count = 0;
+	for (; count < (int)ids.size() && count < maxServerIds; count++)
+		Memory::Write_U16(ids[count], serverIdsPtr + count * 2);
 
-	return maxServerIds; // dummy value
+	return hleLogInfo(Log::sceNet, count);
 }
 
-// Unknown1 = optParam, unknown2 = assignedReqId according to https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/sceNp2.cpp ?
-static int sceNpMatching2GetServerInfo(int ctxId, u32 serverIdPtr, u32 unknown1Ptr, u32 unknown2Ptr)
+// reqParam = {u16 serverId}. The callback data is SceNpMatching2Server {u16 serverId; u8 status; u8 padding;}.
+static int sceNpMatching2GetServerInfo(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	ERROR_LOG(Log::sceNet, "UNIMPL %s(%d, %08x[%d], %08x, %08x[%08x]) at %08x", __FUNCTION__, ctxId, serverIdPtr, Memory::Read_U16(serverIdPtr), unknown1Ptr, unknown2Ptr, Memory::Read_U32(unknown2Ptr), currentMIPS->pc);
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
 
-	if (!Memory::IsValidAddress(serverIdPtr) || !Memory::IsValidAddress(unknown2Ptr))
+	if (!Memory::IsValidRange(reqParamPtr, 2) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	// Server ID is a 16-bit variable according to JPCSP
-	int serverId = Memory::Read_U16(serverIdPtr);
-
+	const u16 serverId = Memory::Read_U16(reqParamPtr);
 	if (serverId == 0)
 		return hleLogError(Log::sceNet, 0x80550CBF); // Should be SCE_NP_MATCHING2_ERROR_INVALID_SERVER_ID ?
 
-	// Output to unknown1(infoBuffer)? and unknown2(infoLength or flags)?
-	// Patapon 3 is using serverId at 09FFF2F4, unknown1 at 09FFF2E4, unknown2 at 09FFF2E0, which mean unknown1's can only fit upto 16-bytes
-	// Patapon 3 seems to be copying data from unknown1 with a fixed size of 20-bytes?
-	// input unknown1 struct: based on Fat Princess (US)
-	// 	   0000 32-bit function address (callback?) 0x08A08B40
-	// 	   0004 32-bit pointer to a struct? (callback args?) 0x09888158 (contains 32-bit (-1) + 32-bit (1) + 16-bit ctxId(0001) + 32bit 0x06913801? + 16-bit serverId(1234), so on), probably only 2x 32-bit struct?
-	// 	   0008 32-bit set to 0
-	// 	   000a 16-bit set to 0
-	//
-	u32 cbFunc = Memory::Read_U32(unknown1Ptr);
-	u32 cbArg = Memory::Read_U32(unknown1Ptr + 0x04);
-
-	// Notify callback handler
-	if (Memory::IsValidAddress(cbFunc)) {
-		// The cbFunc seems to be storing s0~s4(s0 pointing to 0x0996DD58 containing data similar to 0x09888158 above on the 1st 2x 32-bit data, s1 seems to be ctxId, s2~s4=0xdeadbeef) into stack and use a0~t1 (6 args?):
-		//		Arg1(a0) & Arg3(a2) are being masked with 0xffff (16-bit id?)
-		//		This callback tried to load data from address 0x08BD4860+8 (not part of arg? which being set using content of unknown2 not long after returning from sceNpMatching2GetServerInfo, so we may need to give some delay before calling this callback)
-		//		and comparing it with Arg2(a1), repeated by increasing the address 0x08BD4860 by 288 bytes on each loop for 64 times or until it found a matching one.
-		//		When a match is found the callback will process the address further, otherwise exit the callback.
-		//		Matching address struct: (zeroed before calling sceNpMatching2GetServerInfo? and set after returning from sceNpMatching2GetServerInfo?)
-		//			0000 32-bit func address (another callback?) 0x08A07EF4
-		//			0008 32-bit value from unknown2 content, being set not long after returning from sceNpMatching2GetServerInfo
-		//			000c 32-bit unknown 
-		//			0010 8-bit status to indicate not updated from callback yet? initially 0, set to 1 not long after returning from sceNpMatching2GetServerInfo (along with unknown2 content)
-		//
-		// There args are supposed to be constructed in the stack and the data need to be available even after returning from this function, so these args + optional data probably copied to somewhere
-		NpMatching2Args args = {};
-		args.data[0] = PSP_NP_MATCHING2_EVENT_0001;
-		args.data[1] = PSP_NP_MATCHING2_STATE_1001; // or size of data?
-		args.data[2] = serverIdPtr; // serverId or was it pointing to optional data at last arg (ie. args[10] where serverId is stored)?
-		args.data[3] = unknown1Ptr;
-		//args.data[4] = a boolean(0/1) related to a u8 value from the struct at args[9] (value XOR 0x04 == 0)
-		args.data[5] = unknown2Ptr;
-		args.data[6] = 0;
-		//args.data[8] = 0 or a pointer to a struct related to context?
-		//args.data[9] = 0 or a pointer to a struct related to context and matched serverId?
-		//args.data[10] = serverId;
-
-		notifyNpMatching2Handlers(args, ctxId, serverId, 0, 0, 0, 0, 0, 1);
-
-		Memory::Write_U32(args.data[1], unknown2Ptr); // server status or flags?
+	NpMatching2ServerInfo info{};
+	int err = GetNpMatching2Backend().GetServerInfo(serverId, &info);
+	u32 data = 0;
+	if (err >= 0) {
+		data = NpMatching2AllocResponse();
+		if (data) {
+			Memory::Write_U16(info.serverId, data);
+			Memory::Write_U8(info.status, data + 2);
+		} else {
+			err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+		}
 	}
 
-	// After returning, Fat Princess will loop for 64 times (increasing the address by 288 bytes on each loop) or until found a zero status byte (0x08BD4860 + 0x10), looking for empty/available entry to set?
-	return 0;
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0001, err, data);
+	return hleLogInfo(Log::sceNet, 0, "serverId=%d -> reqId=%d, status=%d, error=%08x", serverId, reqId, info.status, err);
+}
+
+// reqParam = {u16 serverId}. The callback data is {u32 worldPtr; u32 worldNum;}. PSP2i reads the u32 worldId
+// at worldPtr + 4 and needs it to be non-zero. The rest of the PSP world struct is a guess: a "next" pointer
+// at +0 (like the PSP room lists), then the PS3 SceNpMatching2World fields.
+static int sceNpMatching2GetWorldInfoList(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+
+	if (!Memory::IsValidRange(reqParamPtr, 2) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	const u16 serverId = Memory::Read_U16(reqParamPtr);
+	if (serverId == 0)
+		return hleLogError(Log::sceNet, 0x80550CBF); // Should be SCE_NP_MATCHING2_ERROR_INVALID_SERVER_ID ?
+
+	const u32 WORLD_SIZE = 0x40;
+	std::vector<NpMatching2WorldInfo> worlds;
+	int err = GetNpMatching2Backend().GetWorldInfoList(serverId, &worlds);
+	u32 data = 0;
+	if (err >= 0) {
+		const size_t maxWorlds = (NP_MATCHING2_DATA_SLOT_SIZE - 8) / WORLD_SIZE;
+		if (worlds.size() > maxWorlds)
+			worlds.resize(maxWorlds);
+		data = NpMatching2AllocResponse();
+		if (data) {
+			Memory::Write_U32(worlds.empty() ? 0 : data + 8, data);
+			Memory::Write_U32((u32)worlds.size(), data + 4);
+			for (size_t i = 0; i < worlds.size(); i++) {
+				const u32 w = data + 8 + (u32)i * WORLD_SIZE;
+				const NpMatching2WorldInfo &info = worlds[i];
+				Memory::Write_U32(i + 1 < worlds.size() ? w + WORLD_SIZE : 0, w);
+				Memory::Write_U32(info.worldId, w + 0x04);
+				Memory::Write_U32(info.numOfLobby, w + 0x08);
+				Memory::Write_U32(info.maxNumOfTotalLobbyMember, w + 0x0C);
+				Memory::Write_U32(info.curNumOfTotalLobbyMember, w + 0x10);
+				Memory::Write_U32(info.curNumOfRoom, w + 0x14);
+				Memory::Write_U32(info.curNumOfTotalRoomMember, w + 0x18);
+			}
+		} else {
+			err = SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+		}
+	}
+
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0002, err, data);
+	return hleLogInfo(Log::sceNet, 0, "serverId=%d -> reqId=%d, %d world(s), error=%08x", serverId, reqId, (int)worlds.size(), err);
+}
+
+// Drops the request's pending callback, if it hasn't run yet.
+static int sceNpMatching2AbortRequest(int ctxId, u32 reqId)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+
+	std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);
+	for (auto it = npMatching2Requests.begin(); it != npMatching2Requests.end(); ) {
+		if (it->reqId == reqId)
+			it = npMatching2Requests.erase(it);
+		else
+			++it;
+	}
+	return hleLogInfo(Log::sceNet, 0);
+}
+
+// Room functions PPSSPP didn't know (names from PSP2i's debug strings). They need a real backend, so for
+// now they fail through the request callback instead of leaving the game waiting.
+static int NpMatching2UnimplementedRequest(const char *name, int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr, u32 event)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+
+	u32 reqId = NpMatching2QueueRequest(ctxId, optParamPtr, assignedReqIdPtr, event, SCE_NP_MATCHING2_SERVER_ERROR_SERVICE_UNAVAILABLE, 0);
+	return hleLogError(Log::sceNet, 0, "UNIMPL %s(%d, %08x, %08x, %08x) -> reqId=%d fails with SERVICE_UNAVAILABLE", name, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, reqId);
+}
+
+static int sceNpMatching2GetUserInfoList(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0004);
+}
+
+static int sceNpMatching2SetRoomDataExternal(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0006);
+}
+
+static int sceNpMatching2SendRoomMessage(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0108);
 }
 
 static int sceNpMatching2LeaveRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
@@ -596,9 +643,13 @@ const HLEFunction sceNpMatching2[] = {
 	{0x6D6D0C75, nullptr,		                                        "sceNpMatching2SignalingGetConnectionStatus",	'i', ""       },
 	{0x7BBFC427, nullptr,		                                        "sceNpMatching2JoinRoom",			            'i', ""       },
 	{0x97529ECC, nullptr,		                                        "sceNpMatching2KickoutRoomMember",			    'i', ""       },
-	{0xA53E7C69, nullptr,		                                        "sceNpMatching2GetWorldInfoList",			    'i', ""       },
+	{0xA53E7C69, &WrapI_IUUU<sceNpMatching2GetWorldInfoList>,			"sceNpMatching2GetWorldInfoList",			    'i', "ixxx"   },
 	{0xE6C93DBD, nullptr,		                                        "sceNpMatching2SetRoomDataInternal",			'i', ""       },
-	{0xFADBA9DB, nullptr,		                                        "sceNpMatching2AbortRequest",			        'i', ""       },
+	{0xFADBA9DB, &WrapI_IU<sceNpMatching2AbortRequest>,					"sceNpMatching2AbortRequest",			        'i', "ix"     },
+	{0xC8FC5D41, &WrapI_IUUU<sceNpMatching2GetUserInfoList>,			"sceNpMatching2GetUserInfoList",				'i', "ixxx"   },
+	{0xD7D4AEB2, &WrapI_IUUU<sceNpMatching2SetRoomDataExternal>,		"sceNpMatching2SetRoomDataExternal",			'i', "ixxx"   },
+	{0xF940D9AD, &WrapI_IUUU<sceNpMatching2SendRoomMessage>,			"sceNpMatching2SendRoomMessage",				'i', "ixxx"   },
+	{0x3892E9A6, nullptr,		                                        "sceNpMatching2_3892E9A6",			            'i', ""       },
 };
 
 void Register_sceNpMatching2()

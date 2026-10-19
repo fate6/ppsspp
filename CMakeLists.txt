@@ -2448,6 +2448,8 @@ add_library(${CoreLibName} ${CoreLinkType}
 	Core/HLE/sceNp.h
 	Core/HLE/sceNp2.cpp
 	Core/HLE/sceNp2.h
+	Core/HLE/NpMatching2Backend.cpp
+	Core/HLE/NpMatching2Backend.h
 	Core/HLE/scePauth.cpp
 	Core/HLE/scePauth.h
 	Core/HW/SimpleAudioDec.cpp
