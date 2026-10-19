@@ -85,7 +85,7 @@
 #include "KUBridge.h"
 #include "sceNetInet.h"
 #include "sceNetResolver.h"
-// #include "sceNp2.h"
+#include "sceNp2.h"
 #include "sceNet_lib.h"
 
 #define N(s) s
@@ -325,8 +325,9 @@ void RegisterAllModules() {
 	Register_sceSircs();
 	Register_sceNet_lib();
 	Register_sceReg();
-	// Not ready to enable this due to apparent softlocks in Patapon 3.
-	// Register_sceNpMatching2();
+	// Upstream keeps this off due to apparent softlocks in Patapon 3. The PSP2i fork needs it: without it
+	// every sceNpMatching2 import stays an unresolved stub (0x8002013A).
+	Register_sceNpMatching2();
 
 	// add new modules here.
 }
