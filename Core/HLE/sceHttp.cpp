@@ -541,6 +541,10 @@ static int sceHttpsEnd() {
 	return 0;
 }
 
+static int sceHttpsEnableOption(int id) {
+	return hleLogWarning(Log::sceNet, 0, "UNIMPL");
+}
+
 static int sceHttpsDisableOption(int id) {
 	ERROR_LOG(Log::sceNet, "UNIMPL sceHttpsDisableOption(%d)", id);
 	return 0;
@@ -868,7 +872,7 @@ const HLEFunction sceHttp[] = {
 	{0XA4496DE5, &WrapI_IUU<sceHttpSetRedirectCallback>,     "sceHttpSetRedirectCallback",     'i', "ixx"   },
 	{0X267618F4, &WrapI_IUU<sceHttpSetAuthInfoCallback>,     "sceHttpSetAuthInfoCallback",     'i', "ixx"   },
 	{0X569A1481, &WrapI_IUU<sceHttpsSetSslCallback>,         "sceHttpsSetSslCallback",         'i', "ixx"   },
-	{0XBAC31BF1, nullptr,                                    "sceHttpsEnableOption",           '?', ""      },
+	{0XBAC31BF1, &WrapI_I<sceHttpsEnableOption>,             "sceHttpsEnableOption",           'i', "i"     },
 };				
 
 void Register_sceHttp()

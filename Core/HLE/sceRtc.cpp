@@ -287,6 +287,16 @@ static u32 sceRtcGetCurrentTick(u32 tickPtr)
 	return hleNoLog(0);
 }
 
+// Same as sceRtcGetCurrentTick, but meant to be the network-synced time. We have no other clock.
+static u32 sceRtcGetCurrentNetworkTick(u32 tickPtr)
+{
+	u64 curTick = __RtcGetCurrentTick();
+	if (Memory::IsValidAddress(tickPtr))
+		Memory::Write_U64(curTick, tickPtr);
+	hleEatCycles(300);
+	return hleLogDebug(Log::sceRtc, 0);
+}
+
 static u64 sceRtcGetAccumulativeTime()
 {
 	DEBUG_LOG(Log::sceRtc, "sceRtcGetAccumulativeTime()");
@@ -1006,7 +1016,7 @@ const HLEFunction sceRtc[] =
 	{0X62685E98, &WrapI_U<sceRtcGetLastAdjustedTime>,      "sceRtcGetLastAdjustedTime",      'i', "x"  },
 	{0X203CEB0D, &WrapI_U<sceRtcGetLastReincarnatedTime>,  "sceRtcGetLastReincarnatedTime",  'i', "x"  },
 	{0X7D1FBED3, &WrapI_UU<sceRtcSetAlarmTick>,            "sceRtcSetAlarmTick",             'i', "xx" },
-	{0XF5FCC995, nullptr,                                  "sceRtcGetCurrentNetworkTick",    '?', ""   },
+	{0XF5FCC995, &WrapU_U<sceRtcGetCurrentNetworkTick>,    "sceRtcGetCurrentNetworkTick",    'x', "x"  },
 	{0X81FCDA34, nullptr,                                  "sceRtcIsAlarmed",                '?', ""   },
 	{0XFB3B18CD, nullptr,                                  "sceRtcRegisterCallback",         '?', ""   },
 	{0X6A676D2D, nullptr,                                  "sceRtcUnregisterCallback",       '?', ""   },

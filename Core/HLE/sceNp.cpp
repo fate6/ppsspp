@@ -640,10 +640,20 @@ void Register_sceNpService()
 	RegisterHLEModule("sceNpService", ARRAY_SIZE(sceNpService), sceNpService);
 }
 
+// The PSN Store is gone. Init/Term succeed so games that set up Commerce2 at boot can carry on;
+// the store calls themselves stay unimplemented.
+static int sceNpCommerce2Init() {
+	return hleLogWarning(Log::sceNet, 0, "UNIMPL");
+}
+
+static int sceNpCommerce2Term() {
+	return hleLogWarning(Log::sceNet, 0, "UNIMPL");
+}
+
 // TODO: Move NpCommerce2-related stuff to sceNpCommerce2.cpp?
 const HLEFunction sceNpCommerce2[] = {
 	{0X005B5F20, nullptr,                            "sceNpCommerce2GetProductInfoStart",				'?', ""   },
-	{0X0E9956E3, nullptr,                            "sceNpCommerce2Init",								'?', ""   },
+	{0X0E9956E3, &WrapI_V<sceNpCommerce2Init>,       "sceNpCommerce2Init",								'i', ""   },
 	{0X1888A9FE, nullptr,                            "sceNpCommerce2DestroyReq",						'?', ""   },
 	{0X1C952DCB, nullptr,                            "sceNpCommerce2GetGameProductInfo",				'?', ""   },
 	{0X2B25F6E9, nullptr,                            "sceNpCommerce2CreateSessionStart",				'?', ""   },
@@ -651,7 +661,7 @@ const HLEFunction sceNpCommerce2[] = {
 	{0X4ECD4503, nullptr,                            "sceNpCommerce2CreateSessionCreateReq",			'?', ""   },
 	{0X590A3229, nullptr,                            "sceNpCommerce2GetSessionInfo",					'?', ""   },
 	{0X6F1FE37F, nullptr,                            "sceNpCommerce2CreateCtx",							'?', ""   },
-	{0XA5A34EA4, nullptr,                            "sceNpCommerce2Term",								'?', ""   },
+	{0XA5A34EA4, &WrapI_V<sceNpCommerce2Term>,       "sceNpCommerce2Term",								'i', ""   },
 	{0XAA4A1E3D, nullptr,                            "sceNpCommerce2GetProductInfoGetResult",			'?', ""   },
 	{0XBC61FFC8, nullptr,                            "sceNpCommerce2CreateSessionGetResult",			'?', ""   },
 	{0XC7F32242, nullptr,                            "sceNpCommerce2AbortReq",							'?', ""   },

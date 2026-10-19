@@ -160,6 +160,9 @@ static PSPNetconfDialog *netDialog;
 static PSPScreenshotDialog *screenshotDialog;
 static PSPGamedataInstallDialog *gamedataInstallDialog;
 static PSPNpSigninDialog *npSigninDialog;
+// sceUtilityPsn* state. Not saved in savestates (the dialog only lives for a few frames).
+static PSPDialog::DialogStatus psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_NONE;
+static u32 psnDialogParamAddr = 0;
 
 // A lot of state seems to be shared between the various dialog types.
 static int oldStatus = -1;
@@ -318,6 +321,8 @@ void __UtilityInit() {
 
 	currentDialogType = UtilityDialogType::NONE;
 	DeactivateDialog();
+	psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_NONE;
+	psnDialogParamAddr = 0;
 	SavedataParam::Init();
 	currentlyLoadedModules.clear();
 	volatileUnlockEvent = CoreTiming::RegisterEvent("UtilityVolatileUnlock", UtilityVolatileUnlock);
@@ -1374,6 +1379,45 @@ static int sceUtilityNpSigninGetStatus() {
 	return hleLogVerbose(Log::sceUtility, status, "status: %s", UtilityDialogStatusToString(status));
 }
 
+// PSN sign-in dialog (sceUtilityPsn*). No UI: it walks INITIALIZE -> RUNNING -> FINISHED -> SHUTDOWN -> NONE
+// and reports success, as if the user was already signed in. The param starts with pspUtilityDialogCommon.
+static int sceUtilityPsnInitStart(u32 paramsPtr) {
+	if (psnDialogStatus != PSPDialog::SCE_UTILITY_STATUS_NONE)
+		return hleLogWarning(Log::sceUtility, SCE_ERROR_UTILITY_INVALID_STATUS, "dialog already running");
+	if (!Memory::IsValidRange(paramsPtr, sizeof(pspUtilityDialogCommon)))
+		return hleLogError(Log::sceUtility, SCE_ERROR_UTILITY_INVALID_PARAM_SIZE, "bad param");
+	psnDialogParamAddr = paramsPtr;
+	psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_INITIALIZE;
+	return hleLogInfo(Log::sceUtility, 0, "FAKE: PSN sign-in dialog, reporting success");
+}
+
+static int sceUtilityPsnUpdate(int animSpeed) {
+	if (psnDialogStatus == PSPDialog::SCE_UTILITY_STATUS_RUNNING) {
+		auto param = PSPPointer<pspUtilityDialogCommon>::Create(psnDialogParamAddr);
+		param->result = SCE_UTILITY_DIALOG_RESULT_SUCCESS;
+		param.NotifyWrite("PsnDialogResult");
+		psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_FINISHED;
+	}
+	return hleLogDebug(Log::sceUtility, 0);
+}
+
+static int sceUtilityPsnShutdownStart() {
+	if (psnDialogStatus != PSPDialog::SCE_UTILITY_STATUS_FINISHED)
+		return hleLogWarning(Log::sceUtility, SCE_ERROR_UTILITY_INVALID_STATUS, "not finished");
+	psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_SHUTDOWN;
+	return hleLogDebug(Log::sceUtility, 0);
+}
+
+static int sceUtilityPsnGetStatus() {
+	const PSPDialog::DialogStatus status = psnDialogStatus;
+	// Advance the transient states on the next poll, like the real dialogs do after a short delay.
+	if (status == PSPDialog::SCE_UTILITY_STATUS_INITIALIZE)
+		psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_RUNNING;
+	else if (status == PSPDialog::SCE_UTILITY_STATUS_SHUTDOWN)
+		psnDialogStatus = PSPDialog::SCE_UTILITY_STATUS_NONE;
+	return hleLogDebug(Log::sceUtility, status, "status: %s", UtilityDialogStatusToString(status));
+}
+
 static void sceUtilityInstallInitStart(u32 unknown) {
 	WARN_LOG_REPORT(Log::sceUtility, "UNIMPL sceUtilityInstallInitStart()");
 	return hleNoLogVoid();
@@ -1554,10 +1598,10 @@ const HLEFunction sceUtility[] =
 	{0XDB4149EE, nullptr,                                          "sceUtility_DB4149EE",                    '?', ""   },
 	{0XCFE7C460, nullptr,                                          "sceUtility_CFE7C460",                    '?', ""   },
 
-	{0XC130D441, nullptr,                                          "sceUtilityPsnShutdownStart",             '?', ""   },
-	{0XA7BB7C67, nullptr,                                          "sceUtilityPsnInitStart",                 '?', ""   },
-	{0X0940A1B9, nullptr,                                          "sceUtilityPsnUpdate",                    '?', ""   },
-	{0X094198B8, nullptr,                                          "sceUtilityPsnGetStatus",                 '?', ""   },
+	{0XC130D441, &WrapI_V<sceUtilityPsnShutdownStart>,             "sceUtilityPsnShutdownStart",             'i', ""   },
+	{0XA7BB7C67, &WrapI_U<sceUtilityPsnInitStart>,                 "sceUtilityPsnInitStart",                 'i', "x"  },
+	{0X0940A1B9, &WrapI_I<sceUtilityPsnUpdate>,                    "sceUtilityPsnUpdate",                    'i', "i"  },
+	{0X094198B8, &WrapI_V<sceUtilityPsnGetStatus>,                 "sceUtilityPsnGetStatus",                 'i', ""   },
 
 	{0X9F313D14, nullptr,                                          "sceUtilityAutoConnectShutdownStart",     '?', ""   },
 	{0X3A15CD0A, nullptr,                                          "sceUtilityAutoConnectInitStart",         '?', ""   },
