@@ -617,6 +617,21 @@ static int sceNpRosterDeleteRequest(s32 rosterId) {
 	return hleLogError(Log::sceNet, 0, "UNIMPL");
 }
 
+// Sign-in refresh for long sessions (names from PSP2i's debug strings, PSP only). param is a 0x10-byte struct
+// starting with its size. We never sign out, so the refresh finishes at once.
+static int sceNpManagerSigninUpdateInitStart(u32 paramAddr) {
+	return hleLogWarning(Log::sceNet, 0, "FAKE");
+}
+
+// 2 = finished, < 0 = error.
+static int sceNpManagerSigninUpdateGetStatus() {
+	return hleLogDebug(Log::sceNet, 2, "FAKE");
+}
+
+static int sceNpManagerSigninUpdateShutdownStart() {
+	return hleLogWarning(Log::sceNet, 0, "FAKE");
+}
+
 const HLEFunction sceNpService[] = {
 	{0X00ACFAC3, &WrapI_V<sceNpServiceTerm>,					"sceNpServiceTerm",						'i', ""       },
 	{0X0F8F5821, &WrapI_UUU<sceNpServiceInit>,					"sceNpServiceInit",						'i', "xxx"    },
@@ -633,6 +648,9 @@ const HLEFunction sceNpService[] = {
 	{0XA01443AA, nullptr,                                       "sceNpRosterGetBlockListEntryCount",    'i', "" },
 	{0X250488F9, nullptr,                                       "sceNpServiceGetMemoryStat",            'i', "" },
 	{0X4B4E4E71, nullptr,                                       "sceNpLookupAbortTransaction ",         'i', "" },
+	{0X1DA3E950, &WrapI_U<sceNpManagerSigninUpdateInitStart>,	"sceNpManagerSigninUpdateInitStart",	'i', "x"      },
+	{0X168B8DE5, &WrapI_V<sceNpManagerSigninUpdateGetStatus>,	"sceNpManagerSigninUpdateGetStatus",	'i', ""       },
+	{0X78802D5F, &WrapI_V<sceNpManagerSigninUpdateShutdownStart>,	"sceNpManagerSigninUpdateShutdownStart",	'i', ""   },
 };
 
 void Register_sceNpService()
