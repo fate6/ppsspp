@@ -178,7 +178,7 @@ u32 GetSyscallOp(std::string_view module, u32 nib);
 bool WriteHLESyscall(std::string_view module, u32 nib, u32 address);
 void CallSyscall(MIPSOpcode op);
 void WriteFuncStub(u32 stubAddr, u32 symAddr);
-void WriteFuncMissingStub(u32 stubAddr, u32 nid);
+void WriteFuncMissingStub(u32 stubAddr, u32 nid, std::string_view moduleName = {});
 
 void HLEReturnFromMipsCall();
 

@@ -110,6 +110,12 @@ struct HLEMipsCallStack {
 
 // No need to save state, always flushed at a syscall end.
 static std::vector<HLEMipsCallInfo> enqueuedMipsCalls;
+// Stubs that got an invalid syscall (unknown NID or unresolved import), so the runtime error can name them.
+struct MissingStubInfo {
+	std::string moduleName;
+	u32 nid;
+};
+static std::map<u32, MissingStubInfo> missingStubs;
 // Does need to be saved, referenced by the stack and owned.
 static std::vector<PSPAction *> mipsCallActions;
 
@@ -305,6 +311,7 @@ void HLEShutdown() {
 	hleAfterSyscall = HLE_AFTER_NOTHING;
 	moduleDB.clear();
 	enqueuedMipsCalls.clear();
+	missingStubs.clear();
 	for (auto p : mipsCallActions) {
 		delete p;
 	}
@@ -407,6 +414,30 @@ const char *GetHLEFuncName(int moduleIndex, int func) {
 	return "[unknown]";
 }
 
+static void RememberMissingStub(u32 stubAddr, std::string_view moduleName, u32 nid) {
+	missingStubs[stubAddr] = { std::string(moduleName), nid };
+}
+
+// Called at runtime when an invalid syscall executes. Stubs are "jr ra; syscall", so $ra is the
+// caller's return address and the instruction at $ra - 8 is normally the "jal stub".
+static void LogMissingStubCall(MIPSOpcode op) {
+	const u32 ra = currentMIPS->r[MIPS_REG_RA];
+	u32 stubAddr = 0;
+	if (Memory::IsValidAddress(ra - 8)) {
+		const MIPSOpcode callOp = Memory::Read_Instruction(ra - 8, true);
+		if ((callOp >> 26) == 3)  // jal
+			stubAddr = ((ra - 8) & 0xF0000000) | ((callOp & 0x03FFFFFF) << 2);
+	}
+	const auto it = missingStubs.find(stubAddr);
+	if (it != missingStubs.end()) {
+		ERROR_LOG(Log::HLE, "Unknown syscall: %s/%08x (stub %08x) called from %08x, returning %08x",
+			it->second.moduleName.c_str(), it->second.nid, stubAddr, ra - 8, SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
+	} else {
+		ERROR_LOG(Log::HLE, "Unknown syscall %08x (stub %08x?) called from %08x, returning %08x",
+			op.encoding, stubAddr, ra - 8, SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
+	}
+}
+
 u32 GetSyscallOp(std::string_view moduleName, u32 nib) {
 	// Special case to hook up bad imports.
 	if (moduleName.empty()) {
@@ -437,8 +468,9 @@ void WriteFuncStub(u32 stubAddr, u32 symAddr)
 	Memory::Write_U32(MIPS_MAKE_NOP(), stubAddr + 4);
 }
 
-void WriteFuncMissingStub(u32 stubAddr, u32 nid)
+void WriteFuncMissingStub(u32 stubAddr, u32 nid, std::string_view moduleName)
 {
+	RememberMissingStub(stubAddr, moduleName, nid);
 	// Write a trap so we notice this func if it's called before resolving.
 	Memory::Write_U32(MIPS_MAKE_JR_RA(), stubAddr); // jr ra
 	Memory::Write_U32(GetSyscallOp("", nid), stubAddr + 4);
@@ -456,8 +488,11 @@ bool WriteHLESyscall(std::string_view moduleName, u32 nib, u32 address)
 	int modindex = GetHLEModuleIndex(moduleName);
 	if (modindex != -1)
 	{
+		const u32 op = GetSyscallOp(moduleName, nib);
+		if ((op & 0x3FFC0) == 0x3FFC0)  // funcnum 0xFFF: NID unknown to the HLE module
+			RememberMissingStub(address, moduleName, nib);
 		Memory::Write_U32(MIPS_MAKE_JR_RA(), address); // jr ra
-		Memory::Write_U32(GetSyscallOp(moduleName, nib), address + 4);
+		Memory::Write_U32(op, address + 4);
 		return true;
 	}
 	else
@@ -906,7 +941,7 @@ const HLEFunction *GetSyscallFuncPointer(MIPSOpcode op) {
 	int modulenum = (callno & 0xFF000) >> 12;
 	if (funcnum == 0xfff) {
 		std::string_view modName = modulenum >= (int)moduleDB.size() ? "(unknown)" : moduleDB[modulenum].name;
-		ERROR_LOG(Log::HLE, "Unknown syscall: Module: '%.*s' (module: %d func: %d)", (int)modName.size(), modName.data(), modulenum, funcnum);
+		DEBUG_LOG(Log::HLE, "Unknown syscall: Module: '%.*s' (module: %d func: %d)", (int)modName.size(), modName.data(), modulenum, funcnum);
 		return NULL;
 	}
 	if (modulenum >= (int)moduleDB.size()) {
@@ -951,6 +986,7 @@ void CallSyscall(MIPSOpcode op) {
 
 	const HLEFunction *info = GetSyscallFuncPointer(op);
 	if (!info) {
+		LogMissingStubCall(op);
 		// We haven't incremented the stack yet.
 		RETURN(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
 		return;
@@ -966,7 +1002,7 @@ void CallSyscall(MIPSOpcode op) {
 	} else {
 		// We haven't incremented the stack yet.
 		RETURN(SCE_KERNEL_ERROR_LIBRARY_NOT_YET_LINKED);
-		ERROR_LOG_REPORT(Log::HLE, "Unimplemented HLE function %s", info->name ? info->name : "(\?\?\?)");
+		ERROR_LOG_REPORT(Log::HLE, "Unimplemented HLE function %s called from %08x", info->name ? info->name : "(\?\?\?)", currentMIPS->r[MIPS_REG_RA] - 8);
 	}
 
 	if (coreCollectDebugStats) {

@@ -713,7 +713,7 @@ void ImportFuncSymbol(const FuncSymbolImport &func, bool reimporting, const char
 	}
 
 	if (shouldHLE || !reimporting) {
-		WriteFuncMissingStub(func.stubAddr, func.nid);
+		WriteFuncMissingStub(func.stubAddr, func.nid, func.moduleName);
 		currentMIPS->InvalidateICache(func.stubAddr, 8);
 	}
 }
@@ -761,7 +761,7 @@ void UnexportFuncSymbol(const FuncSymbolExport &func) {
 		for (auto it = module->importedFuncs.begin(), end = module->importedFuncs.end(); it != end; ++it) {
 			if (func.Matches(*it)) {
 				INFO_LOG(Log::Loader, "Unresolving function %s/%08x", func.moduleName, func.nid);
-				WriteFuncMissingStub(it->stubAddr, it->nid);
+				WriteFuncMissingStub(it->stubAddr, it->nid, it->moduleName);
 				currentMIPS->InvalidateICache(it->stubAddr, 8);
 			}
 		}
