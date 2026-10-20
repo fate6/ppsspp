@@ -317,8 +317,11 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 	switch (ev.kind) {
 	case NpMatching2Event::Kind::Room:
 		build = [ev](u32 *args, int *argc) -> u32 {
-			if (!npMatching2RoomEventCb || ev.roomId != npMatching2RoomId)
+			if (!npMatching2RoomEventCb || ev.roomId != npMatching2RoomId) {
+				WARN_LOG(Log::sceNet, "NpMatching2 room event %04x dropped: callback %08x, room %llu (ours %llu)", ev.event,
+					npMatching2RoomEventCb, (unsigned long long)ev.roomId, (unsigned long long)npMatching2RoomId);
 				return 0;
+			}
 			const u32 data = NpMatching2AllocResponse();
 			if (!data)
 				return 0;
@@ -355,8 +358,11 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 
 	case NpMatching2Event::Kind::RoomMessage:
 		build = [ev](u32 *args, int *argc) -> u32 {
-			if (!npMatching2RoomMessageCb || ev.roomId != npMatching2RoomId)
+			if (!npMatching2RoomMessageCb || ev.roomId != npMatching2RoomId) {
+				WARN_LOG(Log::sceNet, "NpMatching2 room message from member %d dropped: callback %08x, room %llu (ours %llu)", ev.srcMemberId,
+					npMatching2RoomMessageCb, (unsigned long long)ev.roomId, (unsigned long long)npMatching2RoomId);
 				return 0;
+			}
 			const u32 data = NpMatching2AllocResponse();
 			if (!data)
 				return 0;
@@ -375,7 +381,9 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 			const u32 values[8] = { npMatching2RoomCtxId, 0, (u32)ev.roomId, (u32)(ev.roomId >> 32), ev.srcMemberId, 0x2102, data, npMatching2RoomMessageCbArg };
 			memcpy(args, values, sizeof(values));
 			*argc = 8;
-			DEBUG_LOG(Log::sceNet, "NpMatching2 room message from member %d, %u bytes", ev.srcMemberId, len);
+			// PSP2i (handleRoomMessage FUN_08cb38a0) reads only +0x0C/+0x10; the payload starts with a u32 category.
+			INFO_LOG(Log::sceNet, "NpMatching2 room message from member %d, castType %d, %u bytes, category %d -> callback %08x(data=%08x, arg=%08x)",
+				ev.srcMemberId, ev.castType, len, len >= 4 ? (int)Memory::Read_U32(data + 0x20) : -1, npMatching2RoomMessageCb, data, npMatching2RoomMessageCbArg);
 			return npMatching2RoomMessageCb;
 		};
 		break;
