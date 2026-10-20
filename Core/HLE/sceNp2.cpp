@@ -205,8 +205,9 @@ static NpMatching2PendingRequest NpMatching2BeginRequest(int ctxId, u32 optParam
 		req.cbArg = Memory::Read_U32(optParamPtr + 4);
 	}
 	if (!Memory::IsValidAddress(req.cbFunc)) {
+		// Fine for fire-and-forget requests (PSP2i's SendRoomMessage and KickoutRoomMember pass no callback).
 		// TODO: fall back to the context's default request callback, once we track contexts.
-		WARN_LOG(Log::sceNet, "NpMatching2: request %d (event %04x) has no callback", req.reqId, event);
+		DEBUG_LOG(Log::sceNet, "NpMatching2: request %d (event %04x) has no callback", req.reqId, event);
 		req.cbFunc = 0;
 	}
 	std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);

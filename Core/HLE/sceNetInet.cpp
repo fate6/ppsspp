@@ -538,6 +538,10 @@ static int sceNetInetSetsockopt(int socket, int level, int optname, u32 optvalPt
 			// with a plain UDP socket, so ignore it.
 			return hleLogWarning(Log::sceNet, 0, "SO_00001000 (P2P mode?) unsupported, ignoring");
 
+		case 0x2000:
+			// Also set (value 1) by PSP2i on its P2P socket, right after 0x1000. Same story.
+			return hleLogWarning(Log::sceNet, 0, "SO_00002000 (P2P?) unsupported, ignoring");
+
 		default:
 			break;
 		}
@@ -675,9 +679,13 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 	changeBlockingMode(inetSock->sock, 0);
 	int retval = bind(inetSock->sock, (struct sockaddr*)&saddr, len);
 	if (retval < 0) {
-		UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__);
+		const int hostErrno = socket_errno;
+		const int pspErrno = UpdateErrnoFromHost(__KernelGetCurThread(), hostErrno, __FUNCTION__);
 		changeBlockingMode(inetSock->sock, 1);
-		return hleLogError(Log::sceNet, retval);
+		// EADDRINUSE here can also mean another program's outgoing connection got the port as its ephemeral
+		// source port (Windows dynamic port range set below the game's fixed ports).
+		return hleLogError(Log::sceNet, retval, "errno = %s (host %d) Address = %s, Port = %d", convertInetErrno2str(pspErrno), hostErrno,
+			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 	}
 	changeBlockingMode(inetSock->sock, 1);
 	// Update binded port number if it was 0 (any port)
