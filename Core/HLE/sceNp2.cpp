@@ -17,6 +17,7 @@
 
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <set>
 #include <StringUtils.h>
@@ -82,9 +83,19 @@ static u32 npMatching2RoomEventCb = 0, npMatching2RoomEventCbArg = 0;
 static u32 npMatching2RoomMessageCb = 0, npMatching2RoomMessageCbArg = 0;
 
 // Callback data lives in PSP memory. It only has to stay valid while the callback runs, so a small ring
-// of slots is enough. TODO: savestates.
-static const u32 NP_MATCHING2_DATA_SLOT_SIZE = 0x400;
-static const int NP_MATCHING2_DATA_SLOTS = 16;
+// of slots is enough. A SearchRoom page (20 rooms with attributes) needs several KB. TODO: savestates.
+static const u32 NP_MATCHING2_DATA_SLOT_SIZE = 0x4000;
+static const int NP_MATCHING2_DATA_SLOTS = 8;
+
+// Signaling state of the other members of our room, from Established/Dead events, for
+// SignalingGetConnectionStatus. Updated when an event arrives, so it's current by the time the game's
+// signaling callback runs and asks.
+struct NpMatching2PeerStatus {
+	int status;  // 0 inactive, 1 pending, 2 active
+	u32 addr;    // network byte order
+	u16 port;
+};
+static std::map<u16, NpMatching2PeerStatus> npMatching2Peers;
 static u32 npMatching2DataAddr = 0;
 static int npMatching2NextDataSlot = 0;
 
@@ -119,6 +130,61 @@ static void NpMatching2ResetState() {
 	npMatching2RoomId = 0;
 	npMatching2RoomCtxId = 0;
 	npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
+	npMatching2Peers.clear();
+}
+
+// Leaves the room on our side (after LeaveRoom, a kick, or the room going away).
+static void NpMatching2ForgetRoom() {
+	npMatching2RoomId = 0;
+	npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
+	npMatching2Peers.clear();
+}
+
+// ---- PSP request structs (PS3 layouts; int attr {u16 id; u32 val} = 8 bytes, bin attr {u16 id; u8 *ptr;
+// u32 size} = 12 bytes, checked against PSP2i's TRoomAttrBuilder).
+
+static const u32 NP_MATCHING2_MAX_ATTRS = 64;
+static const u32 NP_MATCHING2_MAX_BIN_ATTR_SIZE = 0x1000;
+
+static std::vector<NpMatching2IntAttr> NpMatching2ReadIntAttrs(u32 ptr, u32 num) {
+	std::vector<NpMatching2IntAttr> attrs;
+	if (!ptr || num > NP_MATCHING2_MAX_ATTRS || !Memory::IsValidRange(ptr, num * 8))
+		return attrs;
+	for (u32 i = 0; i < num; i++)
+		attrs.push_back({ Memory::Read_U16(ptr + i * 8), Memory::Read_U32(ptr + i * 8 + 4) });
+	return attrs;
+}
+
+static std::vector<NpMatching2BinAttr> NpMatching2ReadBinAttrs(u32 ptr, u32 num) {
+	std::vector<NpMatching2BinAttr> attrs;
+	if (!ptr || num > NP_MATCHING2_MAX_ATTRS || !Memory::IsValidRange(ptr, num * 12))
+		return attrs;
+	for (u32 i = 0; i < num; i++) {
+		NpMatching2BinAttr attr;
+		attr.id = Memory::Read_U16(ptr + i * 12);
+		const u32 data = Memory::Read_U32(ptr + i * 12 + 4);
+		const u32 size = std::min(Memory::Read_U32(ptr + i * 12 + 8), NP_MATCHING2_MAX_BIN_ATTR_SIZE);
+		if (size && Memory::IsValidRange(data, size)) {
+			attr.data.resize(size);
+			Memory::Memcpy(attr.data.data(), data, size, "NpMatching2BinAttr");
+		}
+		attrs.push_back(std::move(attr));
+	}
+	return attrs;
+}
+
+// Room passwords: PSP2i passes a C string.
+static std::string NpMatching2ReadPassword(u32 ptr) {
+	if (!ptr || !Memory::IsValidAddress(ptr))
+		return "";
+	const char *s = Memory::GetCharPointer(ptr);
+	return std::string(s, strnlen(s, 16));
+}
+
+static std::string NpMatching2MyOnlineId() {
+	SceNpId npId{};
+	NpGetNpId(&npId);
+	return std::string(npId.handle.data, strnlen(npId.handle.data, sizeof(npId.handle.data)));
 }
 
 // Assigns the request id, writes it for the game and reads the callback from optParam.
@@ -278,7 +344,10 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 			memcpy(args, values, sizeof(values));
 			*argc = 7;
 			INFO_LOG(Log::sceNet, "NpMatching2 room event %04x for room %llu", ev.event, (unsigned long long)ev.roomId);
-			return npMatching2RoomEventCb;
+			const u32 cb = npMatching2RoomEventCb;
+			if (ev.event == 0x1103 || ev.event == 0x1104)  // Kickedout / RoomDestroyed: we're out
+				NpMatching2ForgetRoom();
+			return cb;
 		};
 		break;
 
@@ -310,6 +379,12 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 		break;
 
 	case NpMatching2Event::Kind::Signaling:
+		if (ev.roomId == npMatching2RoomId) {
+			if (ev.event == 0x5102)  // Established
+				npMatching2Peers[ev.memberId] = { 2, ev.addr, ev.port };
+			else if (ev.event == 0x5101)  // Dead
+				npMatching2Peers.erase(ev.memberId);
+		}
 		build = [ev](u32 *args, int *argc) -> u32 {
 			if (npMatching2Handlers.empty())
 				return 0;
@@ -405,8 +480,8 @@ static int sceNpMatching2Init(int poolSize, int threadPriority, int cpuAffinityM
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
 	NpMatching2ResetState();
+	NpMatching2SelectBackend();
 	npMatching2Inited = true;
-	INFO_LOG(Log::sceNet, "NpMatching2 backend: %s", GetNpMatching2Backend().Name());
 	return 0;
 }
 
@@ -414,6 +489,7 @@ static int sceNpMatching2Term()
 {
 	ERROR_LOG(Log::sceNet, "UNIMPL %s() at %08x", __FUNCTION__, currentMIPS->pc);
 	npMatching2Inited = false;
+	GetNpMatching2Backend().ContextStop();
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
 	NpMatching2ResetState();
@@ -495,8 +571,8 @@ static int sceNpMatching2ContextStop(int ctxId)
 	//if (!npMatching2Ctx.started)
 	//	return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_STARTED);
 
-	//TODO: Stop any in-progress HTTPClient communication used on sceNpMatching2ContextStart
 	//npMatching2Ctx.started = false;
+	GetNpMatching2Backend().ContextStop();
 
 	return 0;
 }
@@ -702,33 +778,180 @@ static int sceNpMatching2GetUserInfoList(int ctxId, u32 reqParamPtr, u32 optPara
 	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0004);
 }
 
-// Request functions on the room we're in: the reqParam starts with the u64 roomId. On success the
-// callback gets a zeroed response (the games we know don't read it).
-static int NpMatching2SimpleRoomRequest(const char *name, int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr, u32 event, void (NpMatching2Backend::*op)(u64, NpMatching2Done))
+// PSP SceNpMatching2RoomDataExternal (search results), as PSP2i reads it: next @0, serverId @4, worldId @8,
+// lobbyId @0x10, roomId @0x18, u32 maxSlot @0x20, u32 curMemberNum @0x24, passwordSlotMask @0x28,
+// owner (SceNpUserInfo2*: SceNpId, then the name pointer @0x24) @0x30, flagAttr @0x3C, searchable int attrs
+// @0x40/0x44, searchable bin attrs @0x48/0x4C, bin attrs @0x50/0x54. PSP2i reads 0x20/0x24 as u32 (the
+// PS3 struct has u16 slot counts there).
+static const u32 NP_MATCHING2_ROOM_DATA_EXTERNAL_SIZE = 0x58;
+
+// Bump allocator over a callback data slot.
+struct NpMatching2SlotWriter {
+	u32 next;
+	u32 end;
+	u32 Alloc(u32 size) {
+		size = (size + 3) & ~3;
+		if (next + size > end)
+			return 0;
+		const u32 addr = next;
+		next += size;
+		return addr;
+	}
+};
+
+static bool NpMatching2WriteBinAttrs(NpMatching2SlotWriter &out, const std::vector<NpMatching2BinAttr> &attrs, u32 *ptr) {
+	*ptr = 0;
+	if (attrs.empty())
+		return true;
+	const u32 table = out.Alloc((u32)attrs.size() * 12);
+	if (!table)
+		return false;
+	for (size_t i = 0; i < attrs.size(); i++) {
+		const u32 data = attrs[i].data.empty() ? 0 : out.Alloc((u32)attrs[i].data.size());
+		if (!attrs[i].data.empty() && !data)
+			return false;
+		if (data)
+			Memory::Memcpy(data, attrs[i].data.data(), (u32)attrs[i].data.size(), "NpMatching2BinAttr");
+		Memory::Write_U16(attrs[i].id, table + (u32)i * 12);
+		Memory::Write_U32(data, table + (u32)i * 12 + 4);
+		Memory::Write_U32((u32)attrs[i].data.size(), table + (u32)i * 12 + 8);
+	}
+	*ptr = table;
+	return true;
+}
+
+// Writes a linked list of RoomDataExternal entries. Returns how many fit.
+static u32 NpMatching2WriteRoomDataExternalList(NpMatching2SlotWriter &out, const std::vector<NpMatching2Room> &rooms, u32 *first) {
+	*first = 0;
+	u32 prev = 0, count = 0;
+	for (const NpMatching2Room &room : rooms) {
+		NpMatching2SlotWriter attempt = out;
+		const u32 r = attempt.Alloc(NP_MATCHING2_ROOM_DATA_EXTERNAL_SIZE);
+		const u32 owner = attempt.Alloc(0x2C);
+		const u32 ints = room.intAttrsExt.empty() ? 0 : attempt.Alloc((u32)room.intAttrsExt.size() * 8);
+		u32 searchBins = 0, bins = 0;
+		if (!r || !owner || (!room.intAttrsExt.empty() && !ints) ||
+			!NpMatching2WriteBinAttrs(attempt, room.searchBinAttrsExt, &searchBins) ||
+			!NpMatching2WriteBinAttrs(attempt, room.binAttrsExt, &bins)) {
+			WARN_LOG(Log::sceNet, "NpMatching2: only %u of %u rooms fit in the callback data", count, (u32)rooms.size());
+			break;
+		}
+		out = attempt;
+
+		Memory::Memset(r, 0, NP_MATCHING2_ROOM_DATA_EXTERNAL_SIZE, "NpMatching2RoomDataExternal");
+		Memory::Memset(owner, 0, 0x2C, "NpMatching2RoomOwner");
+		Memory::Memcpy(owner, room.ownerOnlineId.data(), (u32)std::min(room.ownerOnlineId.size(), (size_t)16), "NpMatching2RoomOwner");
+		Memory::Write_U32(owner, owner + 0x24);  // onlineName -> the handle inside the SceNpId
+		for (size_t i = 0; i < room.intAttrsExt.size(); i++) {
+			Memory::Write_U16(room.intAttrsExt[i].id, ints + (u32)i * 8);
+			Memory::Write_U32(room.intAttrsExt[i].val, ints + (u32)i * 8 + 4);
+		}
+		Memory::Write_U16(room.serverId, r + 0x04);
+		Memory::Write_U32(room.worldId, r + 0x08);
+		Memory::Write_U64(room.lobbyId, r + 0x10);
+		Memory::Write_U64(room.roomId, r + 0x18);
+		Memory::Write_U32(room.maxSlot, r + 0x20);
+		Memory::Write_U32(room.curMemberNum, r + 0x24);
+		Memory::Write_U64(room.passwordSlotMask, r + 0x28);
+		Memory::Write_U32(owner, r + 0x30);
+		Memory::Write_U32(room.flagAttr, r + 0x3C);
+		Memory::Write_U32(ints, r + 0x40);
+		Memory::Write_U32((u32)room.intAttrsExt.size(), r + 0x44);
+		Memory::Write_U32(searchBins, r + 0x48);
+		Memory::Write_U32((u32)room.searchBinAttrsExt.size(), r + 0x4C);
+		Memory::Write_U32(bins, r + 0x50);
+		Memory::Write_U32((u32)room.binAttrsExt.size(), r + 0x54);
+		if (prev)
+			Memory::Write_U32(r, prev);
+		else
+			*first = r;
+		prev = r;
+		count++;
+	}
+	return count;
+}
+
+// Remembers the room we're now in, with its per-room callbacks.
+static void NpMatching2EnterRoom(const NpMatching2PendingRequest &req, const NpMatching2Room &room, u32 eventCb, u32 eventCbArg, u32 messageCb, u32 messageCbArg) {
+	npMatching2RoomId = room.roomId;
+	npMatching2RoomCtxId = req.ctxId;
+	npMatching2RoomEventCb = eventCb;
+	npMatching2RoomEventCbArg = eventCbArg;
+	npMatching2RoomMessageCb = messageCb;
+	npMatching2RoomMessageCbArg = messageCbArg;
+	npMatching2Peers.clear();
+}
+
+// Finishes CreateJoinRoom/JoinRoom: the callback data is {SceNpMatching2RoomDataInternal *roomDataInternal}.
+static void NpMatching2FinishRoomRequest(const NpMatching2PendingRequest &req, int err, const NpMatching2Room &room) {
+	NpMatching2FinishRequest(req, err, [room](u32 data, s32 err) -> s32 {
+		if (!NpMatching2WriteRoomDataInternal(data + 0x10, NP_MATCHING2_DATA_SLOT_SIZE - 0x10, room))
+			return SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
+		Memory::Write_U32(data + 0x10, data);
+		return err;
+	});
+}
+
+static void NpMatching2ReadRoomCallbacks(u32 roomEventCbParamPtr, u32 roomMessageCbParamPtr, u32 cbs[4]) {
+	cbs[0] = cbs[1] = cbs[2] = cbs[3] = 0;
+	if (Memory::IsValidRange(roomEventCbParamPtr, 8)) {
+		cbs[0] = Memory::Read_U32(roomEventCbParamPtr);
+		cbs[1] = Memory::Read_U32(roomEventCbParamPtr + 4);
+	}
+	if (Memory::IsValidRange(roomMessageCbParamPtr, 8)) {
+		cbs[2] = Memory::Read_U32(roomMessageCbParamPtr);
+		cbs[3] = Memory::Read_U32(roomMessageCbParamPtr + 4);
+	}
+}
+
+// reqParam (0x20) = PS3 SceNpMatching2SetRoomDataExternalRequest: roomId @0, searchable int attrs @8/0xC,
+// searchable bin attrs @0x10/0x14, bin attrs @0x18/0x1C (PSP2i: 8 int attrs 0x4C-0x53, name 0x54, 0x55/0x56).
+static int sceNpMatching2SetRoomDataExternal(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-	if (!Memory::IsValidRange(reqParamPtr, 8) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+	if (!Memory::IsValidRange(reqParamPtr, 0x20) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
 
-	const u64 roomId = Memory::Read_U64(reqParamPtr);
-	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, event);
-	(GetNpMatching2Backend().*op)(roomId, [req](int err) {
+	NpMatching2RoomDataExternalParams params;
+	params.roomId = Memory::Read_U64(reqParamPtr);
+	params.intAttrsExt = NpMatching2ReadIntAttrs(Memory::Read_U32(reqParamPtr + 0x08), Memory::Read_U32(reqParamPtr + 0x0C));
+	params.searchBinAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x10), Memory::Read_U32(reqParamPtr + 0x14));
+	params.binAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x18), Memory::Read_U32(reqParamPtr + 0x1C));
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0006);
+	GetNpMatching2Backend().SetRoomDataExternal(params, [req](int err) {
 		NpMatching2FinishRequest(req, err);
 	});
-	return hleLogInfo(Log::sceNet, 0, "%s: roomId=%llu -> reqId=%d", name, (unsigned long long)roomId, req.reqId);
+	return hleLogInfo(Log::sceNet, 0, "roomId=%llu, %d int / %d searchable bin / %d bin attrs -> reqId=%d", (unsigned long long)params.roomId,
+		(int)params.intAttrsExt.size(), (int)params.searchBinAttrsExt.size(), (int)params.binAttrsExt.size(), req.reqId);
 }
 
-static int sceNpMatching2SetRoomDataExternal(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
-{
-	// TODO: pass the searchable/bin attributes to the backend.
-	return NpMatching2SimpleRoomRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0006, &NpMatching2Backend::SetRoomDataExternal);
-}
-
+// reqParam (0x20) = PS3 SceNpMatching2SendRoomMessageRequest: roomId @0, u8 castType @8 (1 = everyone else,
+// 2 = unicast), u16 dst @0xC (unicast), msg* @0x14, msgLen @0x18. PSP2i sends with no callback.
 static int sceNpMatching2SendRoomMessage(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
-	// TODO: pass castType/destination/payload to the backend.
-	return NpMatching2SimpleRoomRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0108, &NpMatching2Backend::SendRoomMessage);
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x1C) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	NpMatching2RoomMessageParams params;
+	params.roomId = Memory::Read_U64(reqParamPtr);
+	params.castType = Memory::Read_U8(reqParamPtr + 0x08);
+	if (params.castType == 2)
+		params.dst.push_back(Memory::Read_U16(reqParamPtr + 0x0C));
+	const u32 msg = Memory::Read_U32(reqParamPtr + 0x14);
+	const u32 len = std::min(Memory::Read_U32(reqParamPtr + 0x18), NP_MATCHING2_MAX_BIN_ATTR_SIZE);
+	if (len && Memory::IsValidRange(msg, len)) {
+		params.payload.resize(len);
+		Memory::Memcpy(params.payload.data(), msg, len, "NpMatching2RoomMessage");
+	}
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0108);
+	GetNpMatching2Backend().SendRoomMessage(params, [req](int err) {
+		NpMatching2FinishRequest(req, err);
+	});
+	return hleLogDebug(Log::sceNet, 0, "roomId=%llu cast=%d dst=%d len=%u -> reqId=%d", (unsigned long long)params.roomId, params.castType,
+		params.dst.empty() ? 0 : params.dst[0], len, req.reqId);
 }
 
 // reqParam = {u64 roomId; u32 flagFilter; u32 flagAttr; ...} (PSP2i).
@@ -760,75 +983,107 @@ static int sceNpMatching2LeaveRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, 
 	const u64 roomId = Memory::Read_U64(reqParamPtr);
 	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0103);
 	GetNpMatching2Backend().LeaveRoom(roomId, [req, roomId](int err) {
-		if (err >= 0 && roomId == npMatching2RoomId) {
-			npMatching2RoomId = 0;
-			npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
-		}
+		if (err >= 0 && roomId == npMatching2RoomId)
+			NpMatching2ForgetRoom();
 		NpMatching2FinishRequest(req, err);
 	});
 	return hleLogInfo(Log::sceNet, 0, "roomId=%llu -> reqId=%d", (unsigned long long)roomId, req.reqId);
 }
 
+// reqParam (0x20) = PS3 SceNpMatching2KickoutRoomMemberRequest: roomId @0, u16 memberId @8,
+// u8 blockKickFlag @0xA, optData {u8 data[16] @0xC; u32 len @0x1C}. PSP2i kicks with "BYE" and no callback.
+static int sceNpMatching2KickoutRoomMember(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x20) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	const u64 roomId = Memory::Read_U64(reqParamPtr);
+	const u16 memberId = Memory::Read_U16(reqParamPtr + 0x08);
+	const bool blockKick = Memory::Read_U8(reqParamPtr + 0x0A) != 0;
+	std::vector<u8> optData(std::min(Memory::Read_U32(reqParamPtr + 0x1C), 16U));
+	if (!optData.empty())
+		Memory::Memcpy(optData.data(), reqParamPtr + 0x0C, (u32)optData.size(), "NpMatching2KickOptData");
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0105);
+	GetNpMatching2Backend().KickoutRoomMember(roomId, memberId, blockKick, optData, [req](int err) {
+		NpMatching2FinishRequest(req, err);
+	});
+	return hleLogInfo(Log::sceNet, 0, "roomId=%llu member=%d block=%d -> reqId=%d", (unsigned long long)roomId, memberId, blockKick, req.reqId);
+}
+
 // (ctxId, reqParam, optParam, roomEventCbParam, roomMessageCbParam, &assignedReqId), checked against PSP2i.
-// reqParam (0x70 bytes) follows the PS3 SceNpMatching2CreateJoinRoomRequest: worldId @0, lobbyId u64 @8,
-// maxSlot @0x10, flagAttr @0x14, then attribute/password/group pointers. The callback data is
-// {SceNpMatching2RoomDataInternal *roomDataInternal}.
+// reqParam (0x70 bytes) = PS3 SceNpMatching2CreateJoinRoomRequest: worldId @0, lobbyId u64 @8, maxSlot @0x10,
+// flagAttr @0x14, bin attrs internal @0x18/0x1C, searchable int attrs @0x20/0x24, searchable bin attrs
+// @0x28/0x2C, bin attrs ext @0x30/0x34, password (char*) @0x38, ..., member bin attrs internal @0x5C/0x60.
+// The callback data is {SceNpMatching2RoomDataInternal *roomDataInternal}.
 static int sceNpMatching2CreateJoinRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 roomEventCbParamPtr, u32 roomMessageCbParamPtr, u32 assignedReqIdPtr)
 {
 	if (!npMatching2Inited)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-	if (!Memory::IsValidRange(reqParamPtr, 0x18) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+	if (!Memory::IsValidRange(reqParamPtr, 0x64) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	NpMatching2CreateJoinRoomParams params{};
+	NpMatching2CreateJoinRoomParams params;
 	params.serverId = GetNpMatching2Backend().GetServerIdList().empty() ? 0 : GetNpMatching2Backend().GetServerIdList()[0];
 	params.worldId = Memory::Read_U32(reqParamPtr + 0x00);
 	params.lobbyId = Memory::Read_U64(reqParamPtr + 0x08);
 	params.maxSlot = Memory::Read_U32(reqParamPtr + 0x10);
 	params.flagAttr = Memory::Read_U32(reqParamPtr + 0x14);
+	params.binAttrsInternal = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x18), Memory::Read_U32(reqParamPtr + 0x1C));
+	params.intAttrsExt = NpMatching2ReadIntAttrs(Memory::Read_U32(reqParamPtr + 0x20), Memory::Read_U32(reqParamPtr + 0x24));
+	params.searchBinAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x28), Memory::Read_U32(reqParamPtr + 0x2C));
+	params.binAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x30), Memory::Read_U32(reqParamPtr + 0x34));
+	params.password = NpMatching2ReadPassword(Memory::Read_U32(reqParamPtr + 0x38));
+	params.memberBinAttrsInternal = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x5C), Memory::Read_U32(reqParamPtr + 0x60));
 	if (params.worldId == 0)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT, "worldId 0");
 
-	u32 eventCb = 0, eventCbArg = 0, messageCb = 0, messageCbArg = 0;
-	if (Memory::IsValidRange(roomEventCbParamPtr, 8)) {
-		eventCb = Memory::Read_U32(roomEventCbParamPtr);
-		eventCbArg = Memory::Read_U32(roomEventCbParamPtr + 4);
-	}
-	if (Memory::IsValidRange(roomMessageCbParamPtr, 8)) {
-		messageCb = Memory::Read_U32(roomMessageCbParamPtr);
-		messageCbArg = Memory::Read_U32(roomMessageCbParamPtr + 4);
-	}
-
-	SceNpId myNpId{};
-	NpGetNpId(&myNpId);
-	const std::string myOnlineId(myNpId.handle.data, strnlen(myNpId.handle.data, sizeof(myNpId.handle.data)));
-
+	u32 cbs[4];
+	NpMatching2ReadRoomCallbacks(roomEventCbParamPtr, roomMessageCbParamPtr, cbs);
 	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0101);
-	GetNpMatching2Backend().CreateJoinRoom(params, myOnlineId, [req, eventCb, eventCbArg, messageCb, messageCbArg](int err, const NpMatching2Room &room) {
-		if (err >= 0) {
-			npMatching2RoomId = room.roomId;
-			npMatching2RoomCtxId = req.ctxId;
-			npMatching2RoomEventCb = eventCb;
-			npMatching2RoomEventCbArg = eventCbArg;
-			npMatching2RoomMessageCb = messageCb;
-			npMatching2RoomMessageCbArg = messageCbArg;
-		}
+	GetNpMatching2Backend().CreateJoinRoom(params, NpMatching2MyOnlineId(), [req, cbs = std::vector<u32>(cbs, cbs + 4)](int err, const NpMatching2Room &room) {
+		if (err >= 0)
+			NpMatching2EnterRoom(req, room, cbs[0], cbs[1], cbs[2], cbs[3]);
 		INFO_LOG(Log::sceNet, "NpMatching2 CreateJoinRoom reqId=%d -> roomId=%llu, error=%08x", req.reqId, (unsigned long long)room.roomId, err);
-		NpMatching2FinishRequest(req, err, [room](u32 data, s32 err) -> s32 {
-			if (!NpMatching2WriteRoomDataInternal(data + 0x10, NP_MATCHING2_DATA_SLOT_SIZE - 0x10, room))
-				return SCE_NP_MATCHING2_ERROR_OUT_OF_MEMORY;
-			Memory::Write_U32(data + 0x10, data);
-			return err;
-		});
+		NpMatching2FinishRoomRequest(req, err, room);
 	});
-	return hleLogInfo(Log::sceNet, 0, "world=%u maxSlot=%u flagAttr=%08x -> reqId=%d, roomEventCb=%08x, roomMessageCb=%08x",
-		params.worldId, params.maxSlot, params.flagAttr, req.reqId, eventCb, messageCb);
+	return hleLogInfo(Log::sceNet, 0, "world=%u maxSlot=%u flagAttr=%08x attrs %d/%d/%d/%d%s -> reqId=%d",
+		params.worldId, params.maxSlot, params.flagAttr, (int)params.intAttrsExt.size(), (int)params.binAttrsInternal.size(),
+		(int)params.searchBinAttrsExt.size(), (int)params.binAttrsExt.size(), params.password.empty() ? "" : ", password", req.reqId);
 }
 
-// reqParam (0x38 bytes) follows the PS3 SceNpMatching2SearchRoomRequest: option @0, worldId @4,
-// lobbyId u64 @8, rangeFilter {startIndex, max} @0x10, flagFilter @0x18, flagAttr @0x1C, then the
-// int/bin filters and attribute ids. The callback data is
-// {u32 startIndex; u32 total; u32 resultCount; SceNpMatching2RoomDataExternal *rooms}.
+// Same arguments as CreateJoinRoom (PSP2i call site). reqParam (0x30) = PS3 SceNpMatching2JoinRoomRequest:
+// roomId @0, password (char*) @8, joinRoomGroupLabel* @0xC, member bin attrs internal @0x10/0x14, optData @0x18.
+static int sceNpMatching2JoinRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 roomEventCbParamPtr, u32 roomMessageCbParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x18) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	NpMatching2JoinRoomParams params;
+	params.roomId = Memory::Read_U64(reqParamPtr);
+	params.password = NpMatching2ReadPassword(Memory::Read_U32(reqParamPtr + 0x08));
+	params.memberBinAttrsInternal = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x10), Memory::Read_U32(reqParamPtr + 0x14));
+
+	u32 cbs[4];
+	NpMatching2ReadRoomCallbacks(roomEventCbParamPtr, roomMessageCbParamPtr, cbs);
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0102);
+	GetNpMatching2Backend().JoinRoom(params, [req, cbs = std::vector<u32>(cbs, cbs + 4)](int err, const NpMatching2Room &room) {
+		if (err >= 0)
+			NpMatching2EnterRoom(req, room, cbs[0], cbs[1], cbs[2], cbs[3]);
+		INFO_LOG(Log::sceNet, "NpMatching2 JoinRoom reqId=%d -> roomId=%llu, me=%d owner=%d, %d member(s), error=%08x", req.reqId,
+			(unsigned long long)room.roomId, room.myMemberId, room.ownerMemberId, (int)room.members.size(), err);
+		NpMatching2FinishRoomRequest(req, err, room);
+	});
+	return hleLogInfo(Log::sceNet, 0, "roomId=%llu%s -> reqId=%d", (unsigned long long)params.roomId, params.password.empty() ? "" : " (password)", req.reqId);
+}
+
+// reqParam (0x38) = PS3 SceNpMatching2SearchRoomRequest: option @0, worldId @4, lobbyId u64 @8,
+// rangeFilter {startIndex, max} @0x10, flagFilter @0x18, flagAttr @0x1C, int filters @0x20/0x24
+// ({u8 op; pad[3]; {u16 id; u32 val}} = 12 bytes), bin filters @0x28/0x2C, attr ids @0x30/0x34.
+// The callback data is {u32 startIndex; u32 total; u32 resultCount; SceNpMatching2RoomDataExternal *rooms}.
 static int sceNpMatching2SearchRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
 {
 	if (!npMatching2Inited)
@@ -836,32 +1091,91 @@ static int sceNpMatching2SearchRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr,
 	if (!Memory::IsValidRange(reqParamPtr, 0x38) || !Memory::IsValidRange(assignedReqIdPtr, 4))
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_MAX); // Should be SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT ?
 
-	NpMatching2SearchRoomParams params{};
+	NpMatching2SearchRoomParams params;
 	params.worldId = Memory::Read_U32(reqParamPtr + 0x04);
 	params.lobbyId = Memory::Read_U64(reqParamPtr + 0x08);
 	params.startIndex = Memory::Read_U32(reqParamPtr + 0x10);
 	params.max = Memory::Read_U32(reqParamPtr + 0x14);
 	params.flagFilter = Memory::Read_U32(reqParamPtr + 0x18);
 	params.flagAttr = Memory::Read_U32(reqParamPtr + 0x1C);
+	const u32 filters = Memory::Read_U32(reqParamPtr + 0x20), numFilters = Memory::Read_U32(reqParamPtr + 0x24);
+	if (filters && numFilters <= NP_MATCHING2_MAX_ATTRS && Memory::IsValidRange(filters, numFilters * 12)) {
+		for (u32 i = 0; i < numFilters; i++) {
+			const u32 f = filters + i * 12;
+			params.intFilters.push_back({ Memory::Read_U8(f), { Memory::Read_U16(f + 4), Memory::Read_U32(f + 8) } });
+		}
+	}
 
 	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0106);
 	GetNpMatching2Backend().SearchRoom(params, [req, params](int err, const std::vector<NpMatching2Room> &rooms, u32 total) {
-		if (!rooms.empty()) {
-			// TODO: write SceNpMatching2RoomDataExternal entries (matching2.md "LOBBY flow").
-			WARN_LOG(Log::sceNet, "NpMatching2 SearchRoom: %d room(s) from the backend dropped, RoomDataExternal isn't implemented", (int)rooms.size());
-			total = 0;
-		}
-		INFO_LOG(Log::sceNet, "NpMatching2 SearchRoom reqId=%d -> %u room(s), error=%08x", req.reqId, total, err);
-		NpMatching2FinishRequest(req, err, [params, total](u32 data, s32 err) {
+		INFO_LOG(Log::sceNet, "NpMatching2 SearchRoom reqId=%d -> %d of %u room(s), error=%08x", req.reqId, (int)rooms.size(), total, err);
+		NpMatching2FinishRequest(req, err, [params, rooms, total](u32 data, s32 err) {
+			NpMatching2SlotWriter out{ data + 0x10, data + NP_MATCHING2_DATA_SLOT_SIZE };
+			u32 first = 0;
+			const u32 count = NpMatching2WriteRoomDataExternalList(out, rooms, &first);
 			Memory::Write_U32(params.startIndex ? params.startIndex : 1, data);
 			Memory::Write_U32(total, data + 4);
-			Memory::Write_U32(0, data + 8);  // resultCount
-			Memory::Write_U32(0, data + 12);
+			Memory::Write_U32(count, data + 8);  // resultCount
+			Memory::Write_U32(first, data + 12);
 			return err;
 		});
 	});
-	return hleLogInfo(Log::sceNet, 0, "world=%u range=%u+%u flags=%08x/%08x -> reqId=%d",
-		params.worldId, params.startIndex, params.max, params.flagFilter, params.flagAttr, req.reqId);
+	return hleLogInfo(Log::sceNet, 0, "world=%u range=%u+%u flags=%08x/%08x, %d filter(s) -> reqId=%d",
+		params.worldId, params.startIndex, params.max, params.flagFilter, params.flagAttr, (int)params.intFilters.size(), req.reqId);
+}
+
+// reqParam = PS3 SceNpMatching2GetRoomDataExternalListRequest: {u64 *roomId; u32 roomIdNum; u16 *attrId;
+// u32 attrIdNum}. The callback data is {SceNpMatching2RoomDataExternal *rooms; u32 roomNum}.
+static int sceNpMatching2GetRoomDataExternalList(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x10) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	std::vector<u64> roomIds;
+	const u32 ids = Memory::Read_U32(reqParamPtr), num = Memory::Read_U32(reqParamPtr + 4);
+	if (ids && num <= NP_MATCHING2_MAX_ATTRS && Memory::IsValidRange(ids, num * 8)) {
+		for (u32 i = 0; i < num; i++)
+			roomIds.push_back(Memory::Read_U64(ids + i * 8));
+	}
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0007);
+	GetNpMatching2Backend().GetRoomDataExternalList(roomIds, [req](int err, const std::vector<NpMatching2Room> &rooms, u32) {
+		NpMatching2FinishRequest(req, err, [rooms](u32 data, s32 err) {
+			NpMatching2SlotWriter out{ data + 0x10, data + NP_MATCHING2_DATA_SLOT_SIZE };
+			u32 first = 0;
+			const u32 count = NpMatching2WriteRoomDataExternalList(out, rooms, &first);
+			Memory::Write_U32(first, data);
+			Memory::Write_U32(count, data + 4);
+			return err;
+		});
+	});
+	return hleLogInfo(Log::sceNet, 0, "%d room id(s) -> reqId=%d", (int)roomIds.size(), req.reqId);
+}
+
+// (ctxId, roomId u64 in a2:a3, memberId, int *connStatus, SceNetInAddr *peerAddr, u16 *peerPort): synchronous,
+// from the Established/Dead events we've seen. PSP2i needs status 2 (active) before it stores the address.
+static int sceNpMatching2SignalingGetConnectionStatus(int ctxId, u64 roomId, u32 memberId, u32 connStatusPtr, u32 peerAddrPtr, u32 peerPortPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+
+	NpMatching2PeerStatus peer{ 0, 0, 0 };
+	auto it = npMatching2Peers.find((u16)memberId);
+	if (roomId == npMatching2RoomId && it != npMatching2Peers.end())
+		peer = it->second;
+	if (Memory::IsValidRange(connStatusPtr, 4))
+		Memory::Write_U32(peer.status, connStatusPtr);
+	if (Memory::IsValidRange(peerAddrPtr, 4))
+		Memory::Write_U32(peer.addr, peerAddrPtr);
+	if (Memory::IsValidRange(peerPortPtr, 2))
+		Memory::Write_U16(peer.port, peerPortPtr);
+	return hleLogInfo(Log::sceNet, 0, "room=%llu member=%d -> status %d", (unsigned long long)roomId, memberId, peer.status);
+}
+
+static void WrapI_SignalingGetConnectionStatus() {
+	int retval = sceNpMatching2SignalingGetConnectionStatus(PARAM(0), PARAM64(2), PARAM(4), PARAM(5), PARAM(6), PARAM(7));
+	RETURN(retval);
 }
 
 static int sceNpMatching2SendRoomChatMessage(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
@@ -913,10 +1227,10 @@ const HLEFunction sceNpMatching2[] = {
 	{0xAAD0946A, &WrapI_IUUUUU<sceNpMatching2CreateJoinRoom>,			"sceNpMatching2CreateJoinRoom",					'i', "ixxxxx" },
 	{0x81C13E6D, &WrapI_IUUU<sceNpMatching2SearchRoom>,					"sceNpMatching2SearchRoom",						'i', "ixxx"   },
 	{0x55F7837F, &WrapI_IUUU<sceNpMatching2SendRoomChatMessage>,		"sceNpMatching2SendRoomChatMessage",			'i', "ixxx"   },
-	{0x12C5A111, nullptr,		                                        "sceNpMatching2GetRoomDataExternalList",		'i', ""       },
-	{0x6D6D0C75, nullptr,		                                        "sceNpMatching2SignalingGetConnectionStatus",	'i', ""       },
-	{0x7BBFC427, nullptr,		                                        "sceNpMatching2JoinRoom",			            'i', ""       },
-	{0x97529ECC, nullptr,		                                        "sceNpMatching2KickoutRoomMember",			    'i', ""       },
+	{0x12C5A111, &WrapI_IUUU<sceNpMatching2GetRoomDataExternalList>,	"sceNpMatching2GetRoomDataExternalList",		'i', "ixxx"   },
+	{0x6D6D0C75, &WrapI_SignalingGetConnectionStatus,					"sceNpMatching2SignalingGetConnectionStatus",	'i', "iXixxx" },
+	{0x7BBFC427, &WrapI_IUUUUU<sceNpMatching2JoinRoom>,					"sceNpMatching2JoinRoom",			            'i', "ixxxxx" },
+	{0x97529ECC, &WrapI_IUUU<sceNpMatching2KickoutRoomMember>,			"sceNpMatching2KickoutRoomMember",			    'i', "ixxx"   },
 	{0xA53E7C69, &WrapI_IUUU<sceNpMatching2GetWorldInfoList>,			"sceNpMatching2GetWorldInfoList",			    'i', "ixxx"   },
 	{0xE6C93DBD, &WrapI_IUUU<sceNpMatching2SetRoomDataInternal>,		"sceNpMatching2SetRoomDataInternal",			'i', "ixxx"   },
 	{0xFADBA9DB, &WrapI_IU<sceNpMatching2AbortRequest>,					"sceNpMatching2AbortRequest",			        'i', "ix"     },

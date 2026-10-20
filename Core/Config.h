@@ -566,6 +566,8 @@ public:
 	bool bAdhocServerShowPlayerPorts;
 	std::string sInfrastructureDNSServer;
 	std::string sInfrastructureUsername;  // Username used for Infrastructure play. Different restrictions.
+	std::string sNpMatching2Server;  // host:port of a matching server for sceNpMatching2. Empty = local fake backend.
+	std::string sNpLoopbackHost;  // 127.0.0.<n>: bind game sockets to this address (several instances on one PC). Empty = off.
 	bool bInfrastructureAutoDNS;
 	bool bAllowSavestateWhileConnected;  // Developer option, ini-only. No normal users need this, it's always wrong to save/load state when online.
 	bool bAllowSpeedControlWhileConnected;  // Useful in some games but not recommended.
