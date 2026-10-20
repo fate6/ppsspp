@@ -693,6 +693,13 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	saddr.addr.sa_family = dst->sa_family;
 	memcpy(saddr.addr.sa_data, dst->sa_data, sizeof(dst->sa_data));
 
+	// On the PSP's BSD stack, connecting to INADDR_ANY (0.0.0.0) reaches this host. Windows refuses it, so use
+	// loopback. PSP2i's lobby does this: it connects to its own room member entry, which has address 0.
+	if (saddr.addr.sa_family == AF_INET && saddr.in.sin_addr.s_addr == INADDR_ANY) {
+		INFO_LOG(Log::sceNet, "sceNetInetConnect: 0.0.0.0:%d -> 127.0.0.1", ntohs(saddr.in.sin_port));
+		saddr.in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	}
+
 	// Enforcing real blocking-mode on games that use blocking-mode socket (as a temporary fix for UNO), since we don't simulate blocking-mode yet
 	if (!inetSock->nonblocking) {
 		WARN_LOG(Log::sceNet, "Enforcing blocking-mode on Connect! (socket #%d)", socket);
@@ -715,7 +722,7 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 		}
 		int pspErrno = UpdateErrnoFromHost(__KernelGetCurThread(), hostErrno, __FUNCTION__);
 		if (connectInProgress(hostErrno))
-			retval = hleLogDebug(Log::sceNet, retval, "errno = %s Address = %s, Port = %d", convertInetErrno2str(pspErrno), ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
+			retval = hleLogInfo(Log::sceNet, retval, "errno = %s Address = %s, Port = %d", convertInetErrno2str(pspErrno), ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 		else
 			retval = hleLogError(Log::sceNet, retval, "errno = %s Address = %s, Port = %d", convertInetErrno2str(pspErrno), ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 		
