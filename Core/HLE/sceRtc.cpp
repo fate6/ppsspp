@@ -287,14 +287,15 @@ static u32 sceRtcGetCurrentTick(u32 tickPtr)
 	return hleNoLog(0);
 }
 
-// Same as sceRtcGetCurrentTick, but meant to be the network-synced time. We have no other clock.
+// The network-synced time. We don't have one, so fail, as the unimplemented NID did. Games must cope:
+// PSP2i treats a failure as "time 0" everywhere (13 call sites). It also depends on it: its room-message
+// answer to a newcomer's chara-info request (the cat 4 lobby packet, FUN_08a68548) is only sent while
+// "deadline == 0 || now < deadline", with deadline = now + <own member id / 16> minutes. With a working
+// clock that's never true after the first send, so newcomers never see the players already in the lobby.
 static u32 sceRtcGetCurrentNetworkTick(u32 tickPtr)
 {
-	u64 curTick = __RtcGetCurrentTick();
-	if (Memory::IsValidAddress(tickPtr))
-		Memory::Write_U64(curTick, tickPtr);
 	hleEatCycles(300);
-	return hleLogDebug(Log::sceRtc, 0);
+	return hleLogDebug(Log::sceRtc, SCE_KERNEL_ERROR_ERROR, "no network time");
 }
 
 static u64 sceRtcGetAccumulativeTime()
