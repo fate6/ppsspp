@@ -1141,6 +1141,8 @@ int getActivePeerCount(const bool excludeTimedout = true);
  */
 int getLocalIp(sockaddr_in * SocketAddress);
 uint32_t getLocalIp(int sock);
+// [Network] NpLoopbackHost = 127.0.0.<n>, if set: this instance's own address (several instances on one PC).
+bool GetNpLoopbackHost(in_addr *addr);
 
 /*
  * Check if an IP (big-endian/network order) is Private or Public IP

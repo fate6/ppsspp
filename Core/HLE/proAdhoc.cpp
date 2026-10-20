@@ -1881,6 +1881,10 @@ int getLocalIp(sockaddr_in* SocketAddress) {
 	return -1;
 }
 
+bool GetNpLoopbackHost(in_addr *addr) {
+	return !g_Config.sNpLoopbackHost.empty() && inet_pton(AF_INET, g_Config.sNpLoopbackHost.c_str(), addr) == 1;
+}
+
 uint32_t getLocalIp(int sock) {
 	struct sockaddr_in localAddr {};
 	localAddr.sin_addr.s_addr = INADDR_ANY;

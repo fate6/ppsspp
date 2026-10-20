@@ -629,10 +629,8 @@ static int sceNetInetGetsockopt(int socket, int level, int optname, u32 optvalPt
 }
 
 // [Network] NpLoopbackHost = 127.0.0.<n>: one loopback address per PPSSPP instance, so several instances on
-// one PC can each listen on the game's fixed ports (PSP2i: TCP 12000, UDP 8001) and reach each other.
-static bool GetNpLoopbackHost(in_addr *addr) {
-	return !g_Config.sNpLoopbackHost.empty() && inet_pton(AF_INET, g_Config.sNpLoopbackHost.c_str(), addr) == 1;
-}
+// one PC can each listen on the game's fixed ports (PSP2i: TCP 12000, 13009, UDP 8001) and reach each other.
+// The game also sees it as its own IP (Apctl info), see NetApctl_InitInfo.
 
 static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 	INFO_LOG(Log::sceNet, "sceNetInetBind(%i, %08x, %i) at %08x", socket, namePtr, namelen, currentMIPS->pc);
@@ -727,6 +725,14 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 			loopbackHost.s_addr = htonl(INADDR_LOOPBACK);
 		saddr.in.sin_addr = loopbackHost;
 		INFO_LOG(Log::sceNet, "sceNetInetConnect: 0.0.0.0:%d -> %s", ntohs(saddr.in.sin_port), ip2str(loopbackHost).c_str());
+	} else if (saddr.addr.sa_family == AF_INET) {
+		// The host's own LAN IP also means "this instance" with NpLoopbackHost: its sockets listen only there.
+		in_addr loopbackHost;
+		sockaddr_in hostAddr{};
+		if (GetNpLoopbackHost(&loopbackHost) && getLocalIp(&hostAddr) == 0 && saddr.in.sin_addr.s_addr == hostAddr.sin_addr.s_addr) {
+			INFO_LOG(Log::sceNet, "sceNetInetConnect: %s:%d -> %s (NpLoopbackHost)", ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port), ip2str(loopbackHost).c_str());
+			saddr.in.sin_addr = loopbackHost;
+		}
 	}
 
 	// Enforcing real blocking-mode on games that use blocking-mode socket (as a temporary fix for UNO), since we don't simulate blocking-mode yet
