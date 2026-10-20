@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <map>
 #include "Common/StringUtils.h"
+#include "Common/TimeUtil.h"
 #include "Common/Net/SocketCompat.h"
 #include "Common/Data/Text/Parsers.h"
 #include "Common/Serialize/Serializer.h"
@@ -221,6 +223,51 @@ static int sceNetInetGetsockname(int socket, u32 namePtr, u32 namelenPtr) {
 	return hleLogInfo(Log::sceNet, 0);
 }
 
+// [Network] NpP2PTrace: log every P2P datagram with its payload, and once a second how often the game polled its
+// sockets. Timestamps are host ms since PPSSPP started.
+struct P2PTraceCounts {
+	int p2pRecvOk, p2pRecvEagain;
+	int otherRecvfromOk, otherRecvfromEagain;
+	int recvOk, recvEagain;
+	int selects, selectsReady, polls;
+	int p2pSends;
+};
+static P2PTraceCounts p2pTrace{};
+static double p2pTraceSecondStart = 0.0;
+static std::map<int, u16> p2pBoundVport;  // PSP socket -> vport it was bound with
+
+static void P2PTraceTick() {
+	const double now = time_now_d();
+	if (p2pTraceSecondStart == 0.0 || now < p2pTraceSecondStart) {
+		p2pTraceSecondStart = now;
+		return;
+	}
+	if (now - p2pTraceSecondStart < 1.0)
+		return;
+	const P2PTraceCounts &c = p2pTrace;
+	INFO_LOG(Log::sceNet, "P2PTRACE %.0f ms, last %.2f s: P2P recvfrom %d ok / %d EAGAIN, P2P sendto %d, other recvfrom %d ok / %d EAGAIN, recv %d ok / %d EAGAIN, select %d (%d ready), poll %d",
+		now * 1000.0, now - p2pTraceSecondStart, c.p2pRecvOk, c.p2pRecvEagain, c.p2pSends, c.otherRecvfromOk, c.otherRecvfromEagain,
+		c.recvOk, c.recvEagain, c.selects, c.selectsReady, c.polls);
+	p2pTrace = {};
+	p2pTraceSecondStart = now;
+}
+
+static void P2PTraceDatagram(const char *dir, int socket, const SockAddrIN4 &peer, int peerVport, u32 dataPtr, int len) {
+	std::string hex;
+	if (len > 0 && Memory::IsValidRange(dataPtr, len)) {
+		const u8 *data = Memory::GetPointer(dataPtr);
+		hex.reserve(len * 2);
+		static const char digits[] = "0123456789abcdef";
+		for (int i = 0; i < len; i++) {
+			hex += digits[data[i] >> 4];
+			hex += digits[data[i] & 15];
+		}
+	}
+	auto bound = p2pBoundVport.find(socket);
+	INFO_LOG(Log::sceNet, "P2PTRACE %.1f ms %s socket %d (vport %d) peer %s:%d vport %d, %d bytes: %s", time_now_d() * 1000.0, dir, socket,
+		bound != p2pBoundVport.end() ? bound->second : -1, ip2str(peer.in.sin_addr).c_str(), ntohs(peer.in.sin_port), peerVport, len, hex.c_str());
+}
+
 // FIXME: nfds is number of fd(s) as in posix poll, or was it maximum fd value as in posix select? Star Wars Battlefront Renegade seems to set the nfds to 64, while Coded Arms Contagion is using 256
 int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr, u32 timeoutPtr) {
 	SceNetInetFdSet	*readfds = readfdsPtr ? (SceNetInetFdSet*)Memory::GetPointerWrite(readfdsPtr) : nullptr;
@@ -319,6 +366,12 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 	// TODO: Simulate blocking behaviour when timeout = NULL to prevent PPSSPP from freezing
 	// Note: select can overwrite tmout.
 	int retval = select(maxHostSocket + 1, readfds ? &rdfds : nullptr, writefds ? &wrfds : nullptr, exceptfds ? &exfds : nullptr, /*(timeout == NULL) ? NULL :*/ &tmout);
+	if (g_Config.bNpP2PTrace) {
+		p2pTrace.selects++;
+		if (retval > 0)
+			p2pTrace.selectsReady++;
+		P2PTraceTick();
+	}
 
 	// Convert the results back to PSP fd_sets.
 	if (readfds)
@@ -388,6 +441,10 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 	}
 	// TODO: Simulate blocking behaviour when timeout is non-zero to prevent PPSSPP from freezing
 	retval = select(maxHostFd + 1, &readfds, &writefds, &exceptfds, /*(timeout<0)? NULL:*/&tmout);
+	if (g_Config.bNpP2PTrace) {
+		p2pTrace.polls++;
+		P2PTraceTick();
+	}
 	if (retval < 0) {
 		UpdateErrnoFromHost(__KernelGetCurThread(), EINTR, __FUNCTION__);
 		return hleDelayResult(hleLogError(Log::sceNet, retval), "workaround until blocking-socket", 500); // Using hleDelayResult as a workaround for games that need blocking-socket to be implemented
@@ -420,6 +477,10 @@ static int sceNetInetRecv(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
 	int retval = recv(inetSock->sock, (char*)Memory::GetPointer(bufPtr), bufLen, flgs | MSG_NOSIGNAL);
+	if (g_Config.bNpP2PTrace) {
+		(retval < 0 ? p2pTrace.recvEagain : p2pTrace.recvOk)++;
+		P2PTraceTick();
+	}
 	if (retval < 0) {
 		if (UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__) == ERROR_INET_EAGAIN) {
 			retval = hleLogDebug(Log::sceNet, retval, "EAGAIN");
@@ -682,6 +743,7 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 		// (no address reuse) and a later one gets an ephemeral port: it still sends fine, only the first receives.
 		const u16 vport = ntohs(*(u16 *)&saddr.addr.sa_data[6]);
 		INFO_LOG(Log::sceNet, "sceNetInetBind: P2P socket %d, vport %d", socket, vport);
+		p2pBoundVport[socket] = vport;
 		int off = 0;
 		setsockopt(inetSock->sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&off, sizeof(off));
 #if defined(SO_REUSEPORT)
@@ -888,6 +950,7 @@ static int sceNetInetClose(int socket) {
 	}
 
 	g_socketManager.Close(inetSock);
+	p2pBoundVport.erase(socket);
 	return hleLogInfo(Log::sceNet, 0);
 }
 
@@ -904,6 +967,7 @@ static int sceNetInetCloseWithRST(int socket) {
 	sl.l_linger = 0;	// timeout interval in seconds
 	setsockopt(inetSock->sock, SOL_SOCKET, SO_LINGER, (const char*)&sl, sizeof(sl));
 	g_socketManager.Close(inetSock);
+	p2pBoundVport.erase(socket);
 	return hleLogInfo(Log::sceNet, 0);
 }
 
@@ -934,6 +998,17 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
 	int retval = recvfrom(inetSock->sock, (char*)Memory::GetPointer(bufferPtr), len, flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, srclen);
+	if (g_Config.bNpP2PTrace) {
+		if (IsP2PSocket(inetSock)) {
+			(retval < 0 ? p2pTrace.p2pRecvEagain : p2pTrace.p2pRecvOk)++;
+			// The sender's vport doesn't survive the trip over plain UDP, so it shows as -1.
+			if (retval >= 0)
+				P2PTraceDatagram("recv", socket, saddr, -1, bufferPtr, retval);
+		} else {
+			(retval < 0 ? p2pTrace.otherRecvfromEagain : p2pTrace.otherRecvfromOk)++;
+		}
+		P2PTraceTick();
+	}
 	if (retval < 0) {
 		if (UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__) == ERROR_INET_EAGAIN) {
 			retval = hleLogDebug(Log::sceNet, retval, "EAGAIN");
@@ -963,7 +1038,7 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 	DataToHexString(0, 0, Memory::GetPointer(bufferPtr), retval, &datahex);
 	VERBOSE_LOG(Log::sceNet, "Data Dump (%d bytes):\n%s", retval, datahex.c_str());
 
-	if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pRecvCount)) {
+	if (IsP2PSocket(inetSock) && !g_Config.bNpP2PTrace && ShouldLogP2P(&p2pRecvCount)) {
 		INFO_LOG(Log::sceNet, "P2P recvfrom #%d: socket %d, %d bytes from %s:%d", p2pRecvCount, socket, retval,
 			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 	}
@@ -1035,7 +1110,11 @@ static int sceNetInetSendto(int socket, u32 bufferPtr, int len, int flags, u32 t
 		retval = sendto(inetSock->sock, (char*)Memory::GetPointer(bufferPtr), len, flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, dstlen);
 	}
 	const int hostErrno = retval < 0 ? socket_errno : 0;
-	if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pSendCount)) {
+	if (IsP2PSocket(inetSock) && g_Config.bNpP2PTrace) {
+		p2pTrace.p2pSends++;
+		P2PTraceDatagram(retval < 0 ? "send FAILED" : "send", socket, saddr, ntohs(*(u16 *)&saddr.addr.sa_data[6]), bufferPtr, len);
+		P2PTraceTick();
+	} else if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pSendCount)) {
 		INFO_LOG(Log::sceNet, "P2P sendto #%d: socket %d, %d bytes to %s:%d vport %d -> %d (host errno %d)", p2pSendCount, socket, len,
 			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port), ntohs(*(u16 *)&saddr.addr.sa_data[6]), retval, hostErrno);
 	}
