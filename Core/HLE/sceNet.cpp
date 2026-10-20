@@ -758,9 +758,11 @@ void __NetApctlCallbacks()
 		delayus = (adhocEventDelay + adhocExtraDelay);
 	}
 
-	// Temporarily borrowing APctl thread for NpMatching2 callbacks for testing purpose
+	// Temporarily borrowing APctl thread for NpMatching2 callbacks for testing purpose.
+	// Not the 2 s pause used above: Matching2 callbacks carry room messages (PSP2i lobby traffic), and each one
+	// runs to completion on this thread before the next pump anyway.
 	if (NpMatching2ProcessEvents()) {
-		delayus = (adhocEventDelay + adhocExtraDelay);
+		delayus = adhocDefaultDelay;
 	}
 
 	// How AP works probably like this: Game use sceNetApctl function -> sceNetApctl let the hardware know and do their's thing and have a new State -> Let the game know the resulting State through Event on their handler
