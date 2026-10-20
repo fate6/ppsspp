@@ -42,7 +42,7 @@ int convertMsgFlagPSP2Host(int flag) {
 		return MSG_MCAST;
 #endif
 	}
-	return hleLogError(Log::sceNet, flag, "Unknown MSG flag");
+	{ ERROR_LOG(Log::sceNet, "Unknown MSG flag: %d", flag); return flag; }
 }
 
 int convertMsgFlagHost2PSP(int flag) {
@@ -76,7 +76,7 @@ int convertMsgFlagHost2PSP(int flag) {
 		return PSP_NET_INET_MSG_MCAST;
 #endif
 	}
-	return hleLogError(Log::sceNet, flag, "Unknown MSG flag");
+	{ ERROR_LOG(Log::sceNet, "Unknown MSG flag: %d", flag); return flag; }
 }
 
 int convertMSGFlagsPSP2Host(int flags) {
@@ -178,7 +178,7 @@ int convertSocketDomainPSP2Host(int domain) {
 	case PSP_NET_INET_AF_INET:
 		return AF_INET;
 	}
-	return hleLogError(Log::sceNet, domain, "Unknown Socket Domain");
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Domain: %d", domain); return domain; }
 }
 
 int convertSocketDomainHost2PSP(int domain) {
@@ -190,7 +190,7 @@ int convertSocketDomainHost2PSP(int domain) {
 	case AF_INET:
 		return PSP_NET_INET_AF_INET;
 	}
-	return hleLogError(Log::sceNet, domain, "Unknown Socket Domain");
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Domain: %d", domain); return domain; }
 }
 
 std::string inetSocketDomain2str(int domain) {
@@ -225,7 +225,7 @@ int convertSocketTypePSP2Host(int type) {
 		return SOCK_STREAM;				// SOCK_RAW?
 	}
 
-	return hleLogError(Log::sceNet, type, "Unknown Socket Type") & PSP_NET_INET_SOCK_TYPE_MASK;
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Type: %d", type); return type & PSP_NET_INET_SOCK_TYPE_MASK; }
 }
 
 int convertSocketTypeHost2PSP(int type) {
@@ -251,7 +251,7 @@ int convertSocketTypeHost2PSP(int type) {
 #endif
 	}
 
-	return hleLogError(Log::sceNet, type, "Unknown Socket Type") & PSP_NET_INET_SOCK_TYPE_MASK;
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Type: %d", type); return type & PSP_NET_INET_SOCK_TYPE_MASK; }
 }
 
 std::string inetSocketType2str(int type) {
@@ -295,7 +295,7 @@ int convertSocketProtoPSP2Host(int protocol) {
 	case PSP_NET_INET_IPPROTO_RAW:
 		return IPPROTO_RAW;
 	}
-	return hleLogError(Log::sceNet, protocol, "Unknown Socket Protocol");
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Protocol: %d", protocol); return protocol; }
 }
 
 int convertSocketProtoHost2PSP(int protocol) {
@@ -319,7 +319,7 @@ int convertSocketProtoHost2PSP(int protocol) {
 	case IPPROTO_RAW:
 		return PSP_NET_INET_IPPROTO_RAW;
 	}
-	return hleLogError(Log::sceNet, protocol, "Unknown Socket Protocol");
+	{ ERROR_LOG(Log::sceNet, "Unknown Socket Protocol: %d", protocol); return protocol; }
 }
 
 std::string inetSocketProto2str(int protocol) {
@@ -372,7 +372,7 @@ int convertCMsgTypePSP2Host(int type, int level) {
 			return SCM_TIMESTAMP;
 #endif
 	}
-	return hleLogError(Log::sceNet, type, "Unknown CMSG_TYPE (Level = %08x)", level);
+	{ ERROR_LOG(Log::sceNet, "Unknown CMSG_TYPE (Level = %08x): %d", level, type); return type; }
 }
 
 int convertCMsgTypeHost2PSP(int type, int level) {
@@ -401,7 +401,7 @@ int convertCMsgTypeHost2PSP(int type, int level) {
 			return PSP_NET_INET_SCM_TIMESTAMP;
 #endif
 	}
-	return hleLogError(Log::sceNet, type, "Unknown CMSG_TYPE (Level = %08x)", level);
+	{ ERROR_LOG(Log::sceNet, "Unknown CMSG_TYPE (Level = %08x): %d", level, type); return type; }
 }
 
 int convertSockoptLevelPSP2Host(int level) {
@@ -415,7 +415,7 @@ int convertSockoptLevelPSP2Host(int level) {
 	case PSP_NET_INET_SOL_SOCKET:
 		return SOL_SOCKET;
 	}
-	return hleLogError(Log::sceNet, level, "Unknown SockOpt Level");
+	{ ERROR_LOG(Log::sceNet, "Unknown SockOpt Level: %d", level); return level; }
 }
 
 int convertSockoptLevelHost2PSP(int level) {
@@ -429,7 +429,7 @@ int convertSockoptLevelHost2PSP(int level) {
 	case SOL_SOCKET:
 		return PSP_NET_INET_SOL_SOCKET;
 	}
-	return hleLogError(Log::sceNet, level, "Unknown SockOpt Level");
+	{ ERROR_LOG(Log::sceNet, "Unknown SockOpt Level: %d", level); return level; }
 }
 
 std::string inetSockoptLevel2str(int level) {
@@ -567,7 +567,7 @@ int convertSockoptNamePSP2Host(int optname, int level) {
 #endif
 		}
 	}
-	return hleLogError(Log::sceNet, optname, "Unknown or unsupported PSP's SockOpt Name (Level = %08x)", level);
+	{ ERROR_LOG(Log::sceNet, "Unknown or unsupported PSP's SockOpt Name (Level = %08x): %d", level, optname); return optname; }
 }
 
 int convertSockoptNameHost2PSP(int optname, int level) {
@@ -691,7 +691,7 @@ int convertSockoptNameHost2PSP(int optname, int level) {
 #endif
 		}
 	}
-	return hleLogError(Log::sceNet, optname, "Unknown Host's SockOpt Name (Level = %08x)", level);
+	{ ERROR_LOG(Log::sceNet, "Unknown Host's SockOpt Name (Level = %08x): %d", level, optname); return optname; }
 }
 
 std::string inetSockoptName2str(int optname, int level) {
@@ -875,7 +875,7 @@ int convertInetErrnoHost2PSP(int error) {
 #endif
 	}
 	if (error != 0)
-		return hleLogError(Log::sceNet, error, "Unknown Host Error Number (%d)", error);
+		{ ERROR_LOG(Log::sceNet, "Unknown Host Error Number (%d): %d", error, error); return error; }
 	return error;
 }
 
@@ -1004,7 +1004,7 @@ int convertInetErrno2PSPError(int error) {
 #endif
 	}
 	if (error != 0)
-		return hleLogError(Log::sceNet, error, "Unknown PSP Error Number (%d)", error);
+		{ ERROR_LOG(Log::sceNet, "Unknown PSP Error Number (%d): %d", error, error); return error; }
 	return error;
 }
 

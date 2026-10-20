@@ -532,6 +532,12 @@ static int sceNetInetSetsockopt(int socket, int level, int optname, u32 optvalPt
 			// Seen in Outrun 2006 (account registration), assuming that the flag mapping is correct, we can't support this. So we warn-log and pretend success.
 			return hleLogWarning(Log::sceNet, 0, "PSP_NET_INET_SO_ONESBCAST unsupported, ignoring");
 
+		case 0x1000:
+			// Not a BSD option. PSP2i sets it (value 1) right after creating its PSP_NET_INET_SOCK_CONN_DGRAM (6)
+			// socket, the PS3-style "DGRAM_P2P" type with a vport, probably to turn on P2P mode. We back that type
+			// with a plain UDP socket, so ignore it.
+			return hleLogWarning(Log::sceNet, 0, "SO_00001000 (P2P mode?) unsupported, ignoring");
+
 		default:
 			break;
 		}
