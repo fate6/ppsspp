@@ -57,47 +57,55 @@ public:
 		return 0;
 	}
 
-	int SearchRoom(const NpMatching2SearchRoomParams &params, std::vector<NpMatching2Room> *rooms, u32 *total) override {
-		*total = 0;
-		return 0;
+	void SearchRoom(const NpMatching2SearchRoomParams &params, std::function<void(int, const std::vector<NpMatching2Room> &, u32)> done) override {
+		done(0, {}, 0);
 	}
 
-	int CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, NpMatching2Room *room) override {
-		room->serverId = params.serverId;
-		room->worldId = params.worldId;
-		room->lobbyId = params.lobbyId;
-		room->roomId = nextRoomId_++;
-		room->maxSlot = params.maxSlot;
-		room->flagAttr = params.flagAttr;
-		room->ownerMemberId = 1;
-		room->myMemberId = 1;
-		room->members = { { 1, myOnlineId, __RtcGetCurrentTick(), 0 } };
-		currentRoomId_ = room->roomId;
-		INFO_LOG(Log::sceNet, "NpMatching2 (fake): created room %llu in world %u, maxSlot %u", (unsigned long long)room->roomId, params.worldId, params.maxSlot);
-		return 0;
+	void CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, std::function<void(int, const NpMatching2Room &)> done) override {
+		NpMatching2Room room{};
+		room.serverId = params.serverId;
+		room.worldId = params.worldId;
+		room.lobbyId = params.lobbyId;
+		room.roomId = nextRoomId_++;
+		room.maxSlot = params.maxSlot;
+		room.flagAttr = params.flagAttr;
+		room.ownerMemberId = 1;
+		room.myMemberId = 1;
+		room.members = { { 1, myOnlineId, __RtcGetCurrentTick(), 0 } };
+		currentRoomId_ = room.roomId;
+		INFO_LOG(Log::sceNet, "NpMatching2 (fake): created room %llu in world %u, maxSlot %u", (unsigned long long)room.roomId, params.worldId, params.maxSlot);
+		done(0, room);
 	}
 
-	int LeaveRoom(u64 roomId) override {
+	void LeaveRoom(u64 roomId, NpMatching2Done done) override {
 		if (roomId != currentRoomId_)
-			return SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+			return done(SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM);
 		currentRoomId_ = 0;
-		return 0;
+		done(0);
 	}
 
-	int SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr) override {
-		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	void SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr, NpMatching2Done done) override {
+		done(InRoom(roomId));
 	}
 
-	int SetRoomDataExternal(u64 roomId) override {
-		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	void SetRoomDataExternal(u64 roomId, NpMatching2Done done) override {
+		done(InRoom(roomId));
 	}
 
-	int SendRoomMessage(u64 roomId) override {
+	void SendRoomMessage(u64 roomId, NpMatching2Done done) override {
 		// Nobody else is in the room.
-		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+		done(InRoom(roomId));
+	}
+
+	bool PollEvent(NpMatching2Event *event) override {
+		return false;
 	}
 
 private:
+	int InRoom(u64 roomId) const {
+		return roomId == currentRoomId_ ? 0 : SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
+	}
+
 	u64 nextRoomId_ = 1;
 	u64 currentRoomId_ = 0;
 

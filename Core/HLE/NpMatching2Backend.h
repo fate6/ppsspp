@@ -17,13 +17,17 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 
 // The "server side" of sceNpMatching2. sceNp2.cpp deals with PSP memory, request ids and callbacks;
-// a backend only answers the requests. The fake backend answers locally with one server and one world,
+// a backend only answers the requests and reports what happens in the rooms (events).
+//
+// Threading: everything here runs on the emu thread. Room requests are asynchronous: the backend calls
+// `done` exactly once, either right away (fake backend) or later from PollEvent (network backend). The fake backend answers locally with one server and one world,
 // which is enough to get through a game's server select and to host a room alone. A network backend
 // (a server holding shared room state) can replace it later.
 
@@ -78,6 +82,30 @@ struct NpMatching2SearchRoomParams {
 	u32 flagAttr;
 };
 
+// Something the server pushes: a room event (0x1101 MemberJoined ...), a room message (0x2102) or a
+// signaling event (0x5101 Dead / 0x5102 Established).
+struct NpMatching2Event {
+	enum class Kind { Room, RoomMessage, Signaling };
+	Kind kind = Kind::Room;
+	u64 roomId = 0;
+	u16 event = 0;
+	// Room: the member who joined/left (0x1101/0x1102), owner change (0x1105), cause and error.
+	NpMatching2RoomMember member{};
+	u16 prevOwner = 0, newOwner = 0;
+	u8 eventCause = 0;
+	s32 errorCode = 0;  // also Signaling
+	// RoomMessage
+	u16 srcMemberId = 0;
+	u8 castType = 0;
+	std::vector<u8> payload;
+	// Signaling: the peer and its address (network byte order).
+	u16 memberId = 0;
+	u32 addr = 0;
+	u16 port = 0;
+};
+
+using NpMatching2Done = std::function<void(int errorCode)>;
+
 class NpMatching2Backend {
 public:
 	virtual ~NpMatching2Backend() {}
@@ -91,13 +119,17 @@ public:
 	virtual int GetServerInfo(u16 serverId, NpMatching2ServerInfo *info) = 0;
 	virtual int GetWorldInfoList(u16 serverId, std::vector<NpMatching2WorldInfo> *worlds) = 0;
 
-	// Rooms. The attribute blobs and filters are not passed through yet.
-	virtual int SearchRoom(const NpMatching2SearchRoomParams &params, std::vector<NpMatching2Room> *rooms, u32 *total) = 0;
-	virtual int CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, NpMatching2Room *room) = 0;
-	virtual int LeaveRoom(u64 roomId) = 0;
-	virtual int SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr) = 0;
-	virtual int SetRoomDataExternal(u64 roomId) = 0;
-	virtual int SendRoomMessage(u64 roomId) = 0;
+	// Rooms (asynchronous, see above). The attribute blobs and filters are not passed through yet.
+	virtual void SearchRoom(const NpMatching2SearchRoomParams &params, std::function<void(int errorCode, const std::vector<NpMatching2Room> &rooms, u32 total)> done) = 0;
+	virtual void CreateJoinRoom(const NpMatching2CreateJoinRoomParams &params, const std::string &myOnlineId, std::function<void(int errorCode, const NpMatching2Room &room)> done) = 0;
+	virtual void LeaveRoom(u64 roomId, NpMatching2Done done) = 0;
+	virtual void SetRoomDataInternal(u64 roomId, u32 flagFilter, u32 flagAttr, NpMatching2Done done) = 0;
+	virtual void SetRoomDataExternal(u64 roomId, NpMatching2Done done) = 0;
+	virtual void SendRoomMessage(u64 roomId, NpMatching2Done done) = 0;
+
+	// Called from the callback pump. Returns the next pushed event, if any. A network backend also delivers
+	// its pending `done` calls from here.
+	virtual bool PollEvent(NpMatching2Event *event) = 0;
 };
 
 NpMatching2Backend &GetNpMatching2Backend();
