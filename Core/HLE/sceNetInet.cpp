@@ -624,6 +624,12 @@ static int sceNetInetGetsockopt(int socket, int level, int optname, u32 optvalPt
 	return hleLogDebug(Log::sceNet, retval);
 }
 
+// [Network] NpLoopbackHost = 127.0.0.<n>: one loopback address per PPSSPP instance, so several instances on
+// one PC can each listen on the game's fixed ports (PSP2i: TCP 12000, UDP 8001) and reach each other.
+static bool GetNpLoopbackHost(in_addr *addr) {
+	return !g_Config.sNpLoopbackHost.empty() && inet_pton(AF_INET, g_Config.sNpLoopbackHost.c_str(), addr) == 1;
+}
+
 static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 	INFO_LOG(Log::sceNet, "sceNetInetBind(%i, %08x, %i) at %08x", socket, namePtr, namelen, currentMIPS->pc);
 
@@ -652,6 +658,11 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 		getLocalIp(&sockAddr);
 		INFO_LOG(Log::sceNet, "Bind: Address Replacement = %s => %s", ip2str(saddr.in.sin_addr).c_str(), ip2str(sockAddr.sin_addr).c_str());
 		saddr.in.sin_addr.s_addr = sockAddr.sin_addr.s_addr;
+	}
+	in_addr loopbackHost;
+	if (saddr.in.sin_addr.s_addr == INADDR_ANY && GetNpLoopbackHost(&loopbackHost)) {
+		INFO_LOG(Log::sceNet, "Bind: Address Replacement = 0.0.0.0 => %s (NpLoopbackHost)", g_Config.sNpLoopbackHost.c_str());
+		saddr.in.sin_addr = loopbackHost;
 	}
 	// TODO: Make use Port Offset only for PPSSPP to PPSSPP communications (ie. IP addresses available in the group/friendlist), otherwise should be considered as Online Service thus should use the port as is.
 	//saddr.in.sin_port = htons(ntohs(saddr.in.sin_port) + portOffset);
@@ -701,9 +712,13 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 
 	// On the PSP's BSD stack, connecting to INADDR_ANY (0.0.0.0) reaches this host. Windows refuses it, so use
 	// loopback. PSP2i's lobby does this: it connects to its own room member entry, which has address 0.
+	// With NpLoopbackHost, "this host" is that address.
 	if (saddr.addr.sa_family == AF_INET && saddr.in.sin_addr.s_addr == INADDR_ANY) {
-		INFO_LOG(Log::sceNet, "sceNetInetConnect: 0.0.0.0:%d -> 127.0.0.1", ntohs(saddr.in.sin_port));
-		saddr.in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		in_addr loopbackHost;
+		if (!GetNpLoopbackHost(&loopbackHost))
+			loopbackHost.s_addr = htonl(INADDR_LOOPBACK);
+		saddr.in.sin_addr = loopbackHost;
+		INFO_LOG(Log::sceNet, "sceNetInetConnect: 0.0.0.0:%d -> %s", ntohs(saddr.in.sin_port), ip2str(loopbackHost).c_str());
 	}
 
 	// Enforcing real blocking-mode on games that use blocking-mode socket (as a temporary fix for UNO), since we don't simulate blocking-mode yet
