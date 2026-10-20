@@ -294,7 +294,11 @@ static u32 sceRtcGetCurrentTick(u32 tickPtr)
 // clock that's never true after the first send, so newcomers never see the players already in the lobby.
 static u32 sceRtcGetCurrentNetworkTick(u32 tickPtr)
 {
+	static int calls = 0;
 	hleEatCycles(300);
+	// INFO for the first calls only (PSP2i calls it every frame in the lobby).
+	if (calls++ < 10)
+		return hleLogInfo(Log::sceRtc, SCE_KERNEL_ERROR_ERROR, "no network time (call %d, from %08x)", calls, currentMIPS->r[MIPS_REG_RA]);
 	return hleLogDebug(Log::sceRtc, SCE_KERNEL_ERROR_ERROR, "no network time");
 }
 
