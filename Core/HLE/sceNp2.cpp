@@ -478,6 +478,9 @@ static int sceNpMatching2Init(int poolSize, int threadPriority, int cpuAffinityM
 	npMatching2MemStat.npMaxMemSize = 0x4050; // Dummy maximum foot print
 	npMatching2MemStat.npFreeMemSize = npMatching2MemStat.npMemSize;
 
+	// A new session: drop any server connection left from before (the game can re-Init without Term), so
+	// the server forgets the rooms we were in.
+	GetNpMatching2Backend().ContextStop();
 	npMatching2Handlers.clear();
 	npMatching2Events.clear();
 	NpMatching2ResetState();
@@ -586,6 +589,9 @@ static int sceNpMatching2DestroyContext(int ctxId)
 
 	//if (!npMatching2Ctx)
 	//	return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_FOUND); //SCE_NP_MATCHING2_ERROR_INVALID_CONTEXT_ID
+
+	GetNpMatching2Backend().ContextStop();
+	NpMatching2ResetState();
 
 	// Remove callback handler
 	int handlerID = ctxId - 1;

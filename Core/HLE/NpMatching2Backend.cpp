@@ -627,7 +627,9 @@ private:
 			return;
 		}
 
-		if (frame.type & MSG_RESPONSE) {
+		// Pushes (0x9001-0x9003) also have the 0x8000 bit, so check them first.
+		const bool isPush = frame.type >= MSG_PUSH_ROOM_EVENT && frame.type <= MSG_PUSH_SIGNALING;
+		if (!isPush && (frame.type & MSG_RESPONSE)) {
 			auto it = pending_.find(frame.seq);
 			if (it == pending_.end()) {
 				WARN_LOG(Log::sceNet, "NpMatching2 (network): response %04x for unknown seq %u", frame.type, frame.seq);
@@ -783,6 +785,8 @@ private:
 	}
 
 	void Disconnect() {
+		if (conn_)
+			INFO_LOG(Log::sceNet, "NpMatching2 (network): disconnecting from %s", server_.c_str());
 		{
 			std::lock_guard<std::mutex> guard(sendMutex_);
 			connected_ = false;
