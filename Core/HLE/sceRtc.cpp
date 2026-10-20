@@ -290,8 +290,12 @@ static u32 sceRtcGetCurrentTick(u32 tickPtr)
 // The network-synced time. We don't have one, so fail, as the unimplemented NID did. Games must cope:
 // PSP2i treats a failure as "time 0" everywhere (13 call sites). It also depends on it: its room-message
 // answer to a newcomer's chara-info request (the cat 4 lobby packet, FUN_08a68548) is only sent while
-// "deadline == 0 || now < deadline", with deadline = now + <own member id / 16> minutes. With a working
-// clock that's never true after the first send, so newcomers never see the players already in the lobby.
+// "deadline == 0 || now < deadline". Both queueing the request (FUN_08a68454) and every send attempt,
+// failed or not, set deadline = now + <own member id / 16> minutes, which is "now" for ids below 16. With
+// a working clock the gate then never opens again, the request stays queued forever, and newcomers never
+// see the players already in the lobby. When this call fails the game stores deadline = 0 instead, so it
+// retries every frame until the packet builds. (Redirecting the calls to sceRtcGetCurrentTick, as an
+// earlier ISO patch did, brings the bug back.)
 static u32 sceRtcGetCurrentNetworkTick(u32 tickPtr)
 {
 	static int calls = 0;
