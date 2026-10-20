@@ -47,8 +47,15 @@ struct NpMatching2Request {
 	u32 event;
 	u32 errorCode;
 	u32 dataAddr;
+	u64 readyAtUs;  // CoreTiming time before which the callback must not run
 };
 static std::deque<NpMatching2Request> npMatching2Requests;
+
+// Games mark a request as pending *after* the request function returns (PSP2i: call, then state = 2,
+// and the callback sets state = 1). An answer delivered in the same instant can run first, if the
+// callback thread gets switched in at the syscall return; then the game overwrites "done" with "pending"
+// and waits forever. A real server always takes a while, so never answer faster than this.
+static const u64 NP_MATCHING2_MIN_LATENCY_US = 50000;
 static u32 npMatching2NextReqId = 1;
 
 // The room we're in (0 = none), and the per-room callbacks from CreateJoinRoom/JoinRoom:
@@ -107,7 +114,7 @@ static u32 NpMatching2QueueRequest(int ctxId, u32 optParamPtr, u32 assignedReqId
 	}
 
 	std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);
-	npMatching2Requests.push_back({ cbFunc, cbArg, (u32)ctxId, reqId, event, (u32)errorCode, dataAddr });
+	npMatching2Requests.push_back({ cbFunc, cbArg, (u32)ctxId, reqId, event, (u32)errorCode, dataAddr, CoreTiming::GetGlobalTimeUs() + NP_MATCHING2_MIN_LATENCY_US });
 	return reqId;
 }
 
@@ -127,7 +134,7 @@ void notifyNpMatching2Handlers(NpMatching2Args &args, u32 ctxId, u32 serverId, u
 }
 
 bool NpMatching2ProcessEvents() {
-	if (!npMatching2Requests.empty()) {
+	if (!npMatching2Requests.empty() && CoreTiming::GetGlobalTimeUs() >= npMatching2Requests.front().readyAtUs) {
 		const NpMatching2Request req = npMatching2Requests.front();
 		npMatching2Requests.pop_front();
 		const u32 args[6] = { req.ctxId, req.reqId, req.event, req.errorCode, req.dataAddr, req.cbArg };
