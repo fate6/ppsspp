@@ -88,15 +88,32 @@ static u32 npMatching2RoomMessageCb = 0, npMatching2RoomMessageCbArg = 0;
 static const u32 NP_MATCHING2_DATA_SLOT_SIZE = 0x4000;
 static const int NP_MATCHING2_DATA_SLOTS = 8;
 
-// Signaling state of the other members of our room, from Established/Dead events, for
-// SignalingGetConnectionStatus. Updated when an event arrives, so it's current by the time the game's
-// signaling callback runs and asks.
+// Signaling state of other room members, from Established/Dead events, for SignalingGetConnectionStatus.
+// Updated when an event arrives, so it's current by the time the game's signaling callback runs and asks.
+// Keyed by (roomId, memberId) and recorded for any room: the server can push Established for a room we're
+// joining before the JoinRoom answer arrives (PSP2i party join: LeaveRoom(6), JoinRoom(5), then member 1's
+// Established for room 5 came first and was lost while we still counted as in room 6).
 struct NpMatching2PeerStatus {
 	int status;  // 0 inactive, 1 pending, 2 active
 	u32 addr;    // network byte order
 	u16 port;
 };
-static std::map<u16, NpMatching2PeerStatus> npMatching2Peers;
+static std::map<std::pair<u64, u16>, NpMatching2PeerStatus> npMatching2Peers;
+
+// Rooms with a JoinRoom in flight, and pushed room events/messages/signaling for them that arrived before
+// the answer. They're queued after the JoinRoom callback, as a real server's order would be, or dropped if
+// the join fails.
+static std::set<u64> npMatching2JoiningRoomIds;
+static std::vector<NpMatching2Event> npMatching2EarlyEvents;
+
+static void NpMatching2ForgetPeers(u64 roomId) {
+	for (auto it = npMatching2Peers.begin(); it != npMatching2Peers.end(); ) {
+		if (it->first.first == roomId)
+			it = npMatching2Peers.erase(it);
+		else
+			++it;
+	}
+}
 static u32 npMatching2DataAddr = 0;
 static int npMatching2NextDataSlot = 0;
 
@@ -132,13 +149,15 @@ static void NpMatching2ResetState() {
 	npMatching2RoomCtxId = 0;
 	npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
 	npMatching2Peers.clear();
+	npMatching2JoiningRoomIds.clear();
+	npMatching2EarlyEvents.clear();
 }
 
 // Leaves the room on our side (after LeaveRoom, a kick, or the room going away).
 static void NpMatching2ForgetRoom() {
+	NpMatching2ForgetPeers(npMatching2RoomId);
 	npMatching2RoomId = 0;
 	npMatching2RoomEventCb = npMatching2RoomMessageCb = 0;
-	npMatching2Peers.clear();
 }
 
 // ---- PSP request structs (PS3 layouts; int attr {u16 id; u32 val} = 8 bytes, bin attr {u16 id; u8 *ptr;
@@ -313,6 +332,19 @@ static bool NpMatching2WriteRoomDataInternal(u32 addr, u32 size, const NpMatchin
 //   room message (ctxId, -, roomId, srcMemberId, event, data, arg)         from CreateJoinRoom/JoinRoom
 //   signaling    (ctxId, -, roomId, memberId, event, errorCode, arg)       from RegisterSignalingCallback
 static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
+	if (ev.kind == NpMatching2Event::Kind::Signaling) {
+		if (ev.event == 0x5102)  // Established
+			npMatching2Peers[{ ev.roomId, ev.memberId }] = { 2, ev.addr, ev.port };
+		else if (ev.event == 0x5101)  // Dead
+			npMatching2Peers.erase({ ev.roomId, ev.memberId });
+	}
+	if (ev.roomId != npMatching2RoomId && npMatching2JoiningRoomIds.count(ev.roomId)) {
+		INFO_LOG(Log::sceNet, "NpMatching2: event %04x for room %llu arrived before the JoinRoom answer, holding it", ev.event,
+			(unsigned long long)ev.roomId);
+		npMatching2EarlyEvents.push_back(ev);
+		return;
+	}
+
 	NpMatching2CallbackBuilder build;
 	switch (ev.kind) {
 	case NpMatching2Event::Kind::Room:
@@ -389,12 +421,6 @@ static void NpMatching2QueueEvent(const NpMatching2Event &ev) {
 		break;
 
 	case NpMatching2Event::Kind::Signaling:
-		if (ev.roomId == npMatching2RoomId) {
-			if (ev.event == 0x5102)  // Established
-				npMatching2Peers[ev.memberId] = { 2, ev.addr, ev.port };
-			else if (ev.event == 0x5101)  // Dead
-				npMatching2Peers.erase(ev.memberId);
-		}
 		build = [ev](u32 *args, int *argc) -> u32 {
 			if (npMatching2Handlers.empty())
 				return 0;
@@ -895,7 +921,29 @@ static void NpMatching2EnterRoom(const NpMatching2PendingRequest &req, const NpM
 	npMatching2RoomEventCbArg = eventCbArg;
 	npMatching2RoomMessageCb = messageCb;
 	npMatching2RoomMessageCbArg = messageCbArg;
-	npMatching2Peers.clear();
+	// Peers already recorded for this room stay: their Established may have come before the answer.
+}
+
+// After a JoinRoom answer (and its callback is queued): queue what arrived early for that room, or drop it.
+static void NpMatching2ReleaseEarlyEvents(u64 roomId, bool joined) {
+	npMatching2JoiningRoomIds.erase(roomId);
+	std::vector<NpMatching2Event> early;
+	for (auto it = npMatching2EarlyEvents.begin(); it != npMatching2EarlyEvents.end(); ) {
+		if (it->roomId == roomId) {
+			early.push_back(*it);
+			it = npMatching2EarlyEvents.erase(it);
+		} else {
+			++it;
+		}
+	}
+	if (!joined)
+		NpMatching2ForgetPeers(roomId);
+	if (!early.empty())
+		INFO_LOG(Log::sceNet, "NpMatching2: %s %d early event(s) for room %llu", joined ? "delivering" : "dropping", (int)early.size(), (unsigned long long)roomId);
+	if (joined) {
+		for (const NpMatching2Event &ev : early)
+			NpMatching2QueueEvent(ev);
+	}
 }
 
 // Finishes CreateJoinRoom/JoinRoom: the callback data is {SceNpMatching2RoomDataInternal *roomDataInternal}.
@@ -1001,6 +1049,8 @@ static int sceNpMatching2LeaveRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, 
 	GetNpMatching2Backend().LeaveRoom(roomId, [req, roomId](int err) {
 		if (err >= 0 && roomId == npMatching2RoomId)
 			NpMatching2ForgetRoom();
+		else if (err >= 0)
+			NpMatching2ForgetPeers(roomId);
 		NpMatching2FinishRequest(req, err);
 	});
 	return hleLogInfo(Log::sceNet, 0, "roomId=%llu -> reqId=%d", (unsigned long long)roomId, req.reqId);
@@ -1086,12 +1136,18 @@ static int sceNpMatching2JoinRoom(int ctxId, u32 reqParamPtr, u32 optParamPtr, u
 	u32 cbs[4];
 	NpMatching2ReadRoomCallbacks(roomEventCbParamPtr, roomMessageCbParamPtr, cbs);
 	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0102);
-	GetNpMatching2Backend().JoinRoom(params, [req, cbs = std::vector<u32>(cbs, cbs + 4)](int err, const NpMatching2Room &room) {
+	{
+		std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);
+		npMatching2JoiningRoomIds.insert(params.roomId);
+	}
+	GetNpMatching2Backend().JoinRoom(params, [req, joiningRoomId = params.roomId, cbs = std::vector<u32>(cbs, cbs + 4)](int err, const NpMatching2Room &room) {
 		if (err >= 0)
 			NpMatching2EnterRoom(req, room, cbs[0], cbs[1], cbs[2], cbs[3]);
 		INFO_LOG(Log::sceNet, "NpMatching2 JoinRoom reqId=%d -> roomId=%llu, me=%d owner=%d, %d member(s), error=%08x", req.reqId,
 			(unsigned long long)room.roomId, room.myMemberId, room.ownerMemberId, (int)room.members.size(), err);
 		NpMatching2FinishRoomRequest(req, err, room);
+		std::lock_guard<std::recursive_mutex> guard(npMatching2EvtMtx);
+		NpMatching2ReleaseEarlyEvents(joiningRoomId, err >= 0);
 	});
 	return hleLogInfo(Log::sceNet, 0, "roomId=%llu%s -> reqId=%d", (unsigned long long)params.roomId, params.password.empty() ? "" : " (password)", req.reqId);
 }
@@ -1177,8 +1233,8 @@ static int sceNpMatching2SignalingGetConnectionStatus(int ctxId, u64 roomId, u32
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
 
 	NpMatching2PeerStatus peer{ 0, 0, 0 };
-	auto it = npMatching2Peers.find((u16)memberId);
-	if (roomId == npMatching2RoomId && it != npMatching2Peers.end())
+	auto it = npMatching2Peers.find({ roomId, (u16)memberId });
+	if (it != npMatching2Peers.end())
 		peer = it->second;
 	if (Memory::IsValidRange(connStatusPtr, 4))
 		Memory::Write_U32(peer.status, connStatusPtr);
