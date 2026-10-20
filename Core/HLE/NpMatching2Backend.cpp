@@ -676,7 +676,7 @@ private:
 			in_addr in{};
 			if (inet_pton(AF_INET, addr.c_str(), &in) == 1)
 				ev.addr = in.s_addr;
-			ev.port = (u16)JsonNum(root, "port");
+			ev.port = htons((u16)JsonNum(root, "port"));  // the game copies it raw into sin_port
 			break;
 		}
 		default:

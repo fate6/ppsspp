@@ -533,14 +533,14 @@ static int sceNetInetSetsockopt(int socket, int level, int optname, u32 optvalPt
 			return hleLogWarning(Log::sceNet, 0, "PSP_NET_INET_SO_ONESBCAST unsupported, ignoring");
 
 		case 0x1000:
-			// Not a BSD option. PSP2i sets it (value 1) right after creating its PSP_NET_INET_SOCK_CONN_DGRAM (6)
-			// socket, the PS3-style "DGRAM_P2P" type with a vport, probably to turn on P2P mode. We back that type
-			// with a plain UDP socket, so ignore it.
-			return hleLogWarning(Log::sceNet, 0, "SO_00001000 (P2P mode?) unsupported, ignoring");
+			// SCE_NET_INET_SO_USECRYPTO (named in PSP2i's error message). PSP2i sets it (value 1) on its
+			// PSP_NET_INET_SOCK_CONN_DGRAM (6) socket, the PS3-style "DGRAM_P2P" type with a vport. We back that
+			// type with a plain UDP socket and both ends are emulators, so no crypto: ignore it.
+			return hleLogWarning(Log::sceNet, 0, "SO_USECRYPTO unsupported, ignoring");
 
 		case 0x2000:
-			// Also set (value 1) by PSP2i on its P2P socket, right after 0x1000. Same story.
-			return hleLogWarning(Log::sceNet, 0, "SO_00002000 (P2P?) unsupported, ignoring");
+			// Set right after 0x1000 on the same socket; probably SO_USESIGNATURE as on the PS3. Same story.
+			return hleLogWarning(Log::sceNet, 0, "SO_00002000 (USESIGNATURE?) unsupported, ignoring");
 
 		default:
 			break;
@@ -674,8 +674,34 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 	inetSock->addr = ip2str(saddr.in.sin_addr);
 	inetSock->port = ntohs(saddr.in.sin_port);
 
+	const bool isP2P = (inetSock->type & PSP_NET_INET_SOCK_TYPE_MASK) == PSP_NET_INET_SOCK_CONN_DGRAM;
+	if (isP2P) {
+		// DGRAM_P2P: the address carries a vport after sin_addr, and several sockets may share one UDP port with
+		// different vports (PSP2i: vport 1 to receive and vport <own member id> to send, both on 3658). With a plain
+		// UDP socket each, the host would hand incoming datagrams to either one. So the first socket keeps the port
+		// (no address reuse) and a later one gets an ephemeral port: it still sends fine, only the first receives.
+		const u16 vport = ntohs(*(u16 *)&saddr.addr.sa_data[6]);
+		INFO_LOG(Log::sceNet, "sceNetInetBind: P2P socket %d, vport %d", socket, vport);
+		int off = 0;
+		setsockopt(inetSock->sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&off, sizeof(off));
+#if defined(SO_REUSEPORT)
+		setsockopt(inetSock->sock, SOL_SOCKET, SO_REUSEPORT, (const char *)&off, sizeof(off));
+#endif
+	}
 	changeBlockingMode(inetSock->sock, 0);
 	int retval = bind(inetSock->sock, (struct sockaddr*)&saddr, len);
+	if (retval < 0 && isP2P && saddr.in.sin_port != 0) {
+		INFO_LOG(Log::sceNet, "sceNetInetBind: P2P port %d taken by another P2P socket (host errno %d), using an ephemeral port",
+			ntohs(saddr.in.sin_port), socket_errno);
+		SockAddrIN4 ephemeral = saddr;
+		ephemeral.in.sin_port = 0;
+		retval = bind(inetSock->sock, (struct sockaddr*)&ephemeral, len);
+		if (retval == 0) {
+			// The game keeps seeing the port it asked for; nothing to forward.
+			changeBlockingMode(inetSock->sock, 1);
+			return hleLogInfo(Log::sceNet, retval);
+		}
+	}
 	if (retval < 0) {
 		const int hostErrno = socket_errno;
 		const int pspErrno = UpdateErrnoFromHost(__KernelGetCurThread(), hostErrno, __FUNCTION__);
@@ -881,6 +907,19 @@ static int sceNetInetCloseWithRST(int socket) {
 	return hleLogInfo(Log::sceNet, 0);
 }
 
+static bool IsP2PSocket(const InetSocket *inetSock) {
+	return (inetSock->type & PSP_NET_INET_SOCK_TYPE_MASK) == PSP_NET_INET_SOCK_CONN_DGRAM;
+}
+
+// P2P traffic is logged at INFO, but only the first datagrams and then every 200th, so it can be followed in a
+// normal log without flooding it.
+static bool ShouldLogP2P(int *counter) {
+	int n = (*counter)++;
+	return n < 20 || n % 200 == 0;
+}
+static int p2pSendCount = 0;
+static int p2pRecvCount = 0;
+
 static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32 fromPtr, u32 fromlenPtr) {
 	InetSocket *inetSock;
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
@@ -923,6 +962,11 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 	std::string datahex;
 	DataToHexString(0, 0, Memory::GetPointer(bufferPtr), retval, &datahex);
 	VERBOSE_LOG(Log::sceNet, "Data Dump (%d bytes):\n%s", retval, datahex.c_str());
+
+	if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pRecvCount)) {
+		INFO_LOG(Log::sceNet, "P2P recvfrom #%d: socket %d, %d bytes from %s:%d", p2pRecvCount, socket, retval,
+			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
+	}
 
 	// Using hleDelayResult as a workaround for games that need blocking-socket to be implemented (ie. Coded Arms Contagion)
 	return hleDelayResult(hleLogDebug(Log::sceNet, retval,
@@ -990,8 +1034,13 @@ static int sceNetInetSendto(int socket, u32 bufferPtr, int len, int flags, u32 t
 		}*/
 		retval = sendto(inetSock->sock, (char*)Memory::GetPointer(bufferPtr), len, flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, dstlen);
 	}
+	const int hostErrno = retval < 0 ? socket_errno : 0;
+	if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pSendCount)) {
+		INFO_LOG(Log::sceNet, "P2P sendto #%d: socket %d, %d bytes to %s:%d vport %d -> %d (host errno %d)", p2pSendCount, socket, len,
+			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port), ntohs(*(u16 *)&saddr.addr.sa_data[6]), retval, hostErrno);
+	}
 	if (retval < 0) {
-		if (UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__) == ERROR_INET_EAGAIN) {
+		if (UpdateErrnoFromHost(__KernelGetCurThread(), hostErrno, __FUNCTION__) == ERROR_INET_EAGAIN) {
 			return hleLogDebug(Log::sceNet, retval, "EAGAIN");
 		} else {
 			return hleLogError(Log::sceNet, retval);

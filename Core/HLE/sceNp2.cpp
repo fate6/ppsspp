@@ -27,6 +27,7 @@
 #include "Core/HLE/FunctionWrappers.h"
 #include "Core/HLE/sceKernelMemory.h"
 #include "Core/HLE/sceNet.h"
+#include "Core/HLE/proAdhoc.h"
 #include "Core/HLE/sceNp.h"
 #include "Core/HLE/sceNp2.h"
 #include "Core/HLE/NpMatching2Backend.h"
@@ -1177,7 +1178,10 @@ static int sceNpMatching2SignalingGetConnectionStatus(int ctxId, u64 roomId, u32
 		Memory::Write_U32(peer.addr, peerAddrPtr);
 	if (Memory::IsValidRange(peerPortPtr, 2))
 		Memory::Write_U16(peer.port, peerPortPtr);
-	return hleLogInfo(Log::sceNet, 0, "room=%llu member=%d -> status %d", (unsigned long long)roomId, memberId, peer.status);
+	in_addr peerIn{};
+	peerIn.s_addr = peer.addr;
+	return hleLogInfo(Log::sceNet, 0, "room=%llu member=%d -> status %d, %s:%d", (unsigned long long)roomId, memberId, peer.status,
+		ip2str(peerIn).c_str(), ntohs(peer.port));
 }
 
 static void WrapI_SignalingGetConnectionStatus() {
