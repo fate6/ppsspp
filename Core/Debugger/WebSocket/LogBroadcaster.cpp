@@ -32,36 +32,21 @@ public:
 		count_++;
 	}
 
+	// The messages logged since the last call, oldest first (at most the last BUFFER_SIZE of them).
+	// count_ and read_ are running totals; a message's slot is its number modulo BUFFER_SIZE. (This used to
+	// index the ring with read_ itself, so after a client's first BUFFER_SIZE messages it got stale slots
+	// from the start of the ring instead of the new messages.)
 	std::vector<LogMessage> GetMessages() {
 		std::lock_guard<std::mutex> guard(lock_);
-		int splitPoint;
-		int readCount;
-		if (read_ + BUFFER_SIZE < count_) {
-			// We'll start with our oldest then.
-			splitPoint = nextMessage_;
-			readCount = Count();
-		} else {
-			splitPoint = read_;
-			readCount = count_ - read_;
-		}
-
-		read_ = count_;
-
+		int64_t first = read_;
+		if (count_ - first > BUFFER_SIZE)
+			first = count_ - BUFFER_SIZE;  // the older ones were overwritten
 		std::vector<LogMessage> results;
-		int splitEnd = std::min(splitPoint + readCount, (int)BUFFER_SIZE);
-		for (int i = splitPoint; i < splitEnd; ++i) {
-			results.push_back(messages_[i]);
-			readCount--;
-		}
-		for (int i = 0; i < readCount; ++i) {
-			results.push_back(messages_[i]);
-		}
-
+		results.reserve((size_t)(count_ - first));
+		for (int64_t n = first; n < count_; ++n)
+			results.push_back(messages_[n % BUFFER_SIZE]);
+		read_ = count_;
 		return results;
-	}
-
-	int Count() const {
-		return count_ < BUFFER_SIZE ? count_ : BUFFER_SIZE;
 	}
 
 private:
@@ -69,8 +54,8 @@ private:
 	LogMessage messages_[BUFFER_SIZE];
 	std::mutex lock_;
 	int nextMessage_ = 0;
-	int count_ = 0;
-	int read_ = 0;
+	int64_t count_ = 0;
+	int64_t read_ = 0;
 };
 
 // Every debugger connection has its own listener, but the log manager has a single external callback. It used to
