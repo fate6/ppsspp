@@ -296,9 +296,12 @@ static void P2PTraceDatagram(const char *dir, int socket, const SockAddrIN4 &pee
 static int loopbackHoldLogCount = 0;
 
 static bool GetLoopbackTcpEnds(const InetSocket *inetSock, sockaddr_in *local, sockaddr_in *peer) {
-	if ((inetSock->type & PSP_NET_INET_SOCK_TYPE_MASK) != PSP_NET_INET_SOCK_STREAM)
+	// Ask the host socket: PSP2i creates all its sockets as type 10 (SOCK_PACKET?), which the host makes TCP.
+	int hostType = 0;
+	socklen_t len = sizeof(hostType);
+	if (getsockopt(inetSock->sock, SOL_SOCKET, SO_TYPE, (char *)&hostType, &len) != 0 || hostType != SOCK_STREAM)
 		return false;
-	socklen_t len = sizeof(*local);
+	len = sizeof(*local);
 	if (getsockname(inetSock->sock, (sockaddr *)local, &len) != 0 || local->sin_family != AF_INET)
 		return false;
 	len = sizeof(*peer);
