@@ -73,20 +73,38 @@ private:
 	int read_ = 0;
 };
 
+// Every debugger connection has its own listener, but the log manager has a single external callback. It used to
+// point at the newest connection's listener, and any disconnect turned the output off for everyone (and left the
+// callback on a deleted listener). So a short-lived client, e.g. one that only adds a breakpoint, silenced a
+// long-running log stream. Now the callback feeds all connected listeners.
+static std::mutex listenersLock;
+static std::vector<DebuggerLogListener *> listeners;
+
 static void BroadcastCallback(const LogMessage &message, void *userdata) {
-	DebuggerLogListener *listener = (DebuggerLogListener *)userdata;
-	listener->Log(message);
+	std::lock_guard<std::mutex> guard(listenersLock);
+	for (DebuggerLogListener *listener : listeners)
+		listener->Log(message);
 }
 
 LogBroadcaster::LogBroadcaster() {
 	listener_ = new DebuggerLogListener();
-	g_logManager.SetExternalLogCallback(&BroadcastCallback, (void *)listener_);
-	g_logManager.EnableOutput(LogOutput::ExternalCallback);
+	std::lock_guard<std::mutex> guard(listenersLock);
+	listeners.push_back(listener_);
+	if (listeners.size() == 1) {
+		g_logManager.SetExternalLogCallback(&BroadcastCallback, nullptr);
+		g_logManager.EnableOutput(LogOutput::ExternalCallback);
+	}
 }
 
 LogBroadcaster::~LogBroadcaster() {
-	g_logManager.DisableOutput(LogOutput::ExternalCallback);
-	g_logManager.SetExternalLogCallback(nullptr, nullptr);
+	{
+		std::lock_guard<std::mutex> guard(listenersLock);
+		listeners.erase(std::remove(listeners.begin(), listeners.end(), listener_), listeners.end());
+		if (listeners.empty()) {
+			g_logManager.DisableOutput(LogOutput::ExternalCallback);
+			g_logManager.SetExternalLogCallback(nullptr, nullptr);
+		}
+	}
 	delete listener_;
 }
 
