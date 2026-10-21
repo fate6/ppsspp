@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <deque>
 #include <map>
+#include <tuple>
 #include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
 #include "Common/Net/SocketCompat.h"
@@ -19,6 +21,7 @@
 #include "Core/HLE/sceNp2.h"
 #include "Core/HLE/NetInetConstants.h"
 #include "Core/MIPS/MIPS.h"
+#include "Core/HW/Display.h"
 #include "Core/Config.h"
 #include "Core/System.h"
 #include "Core/ELF/ParamSFO.h"
@@ -58,6 +61,15 @@ static int UpdateErrnoFromHost(int threadID, int hostErrno, const char *func) {
 	return lastErrno;
 }
 
+// Bytes sent on loopback TCP flows in the last LoopbackLatencyVblanks vblanks, oldest first ([Network]
+// LoopbackLatencyVblanks, see LoopbackOnSend).
+typedef std::tuple<u32, u16, u32, u16> LoopbackFlowKey;  // sender ip, port, receiver ip, port (network order)
+struct LoopbackChunk {
+	int sentVCount;
+	int bytes;
+};
+static std::map<LoopbackFlowKey, std::deque<LoopbackChunk>> loopbackHeld;
+
 bool netInetInited = false;
 
 void __NetInetShutdown() {
@@ -68,6 +80,7 @@ void __NetInetShutdown() {
 	netInetInited = false;
 	g_socketManager.CloseAll();
 	g_inetLastErrno.clear();
+	loopbackHeld.clear();
 }
 
 static int sceNetInetInit() {
@@ -268,6 +281,91 @@ static void P2PTraceDatagram(const char *dir, int socket, const SockAddrIN4 &pee
 		bound != p2pBoundVport.end() ? bound->second : -1, ip2str(peer.in.sin_addr).c_str(), ntohs(peer.in.sin_port), peerVport, len, hex.c_str());
 }
 
+// [Network] LoopbackLatencyVblanks: TCP data sent between two of this instance's own sockets (both ends on
+// 127.x.x.x) becomes readable by the receiving socket only N emulated vblanks after the send.
+// PSP2i's online host runs the game's lobby server in-process and connects to it over loopback. On a PSP each hop
+// goes through the TCP stack and takes a frame or more; the game relies on that: the server's one-time C10 S05
+// (party table) must reach the client after the party-lobby scene has created the table. With host loopback the
+// reply was readable at the client's next poll, in the same frame, and the client dropped it, so the mission
+// counter bounced (docs/protocol/mission-counter.md, Update 9). 4 vblanks is the minimum that works there.
+// The data still goes through the host socket at once. The sender stamps every send with the vblank count, and the
+// receiver hides the bytes sent less than N vblanks ago: they're the newest bytes in the stream, so the readable
+// part is the host's queued byte count minus them. recv is capped to that, and select/poll don't report the socket
+// readable while it's 0. Vblanks, not wall time, so fast-forward and slowdown don't change the game-side timing.
+// (loopbackHeld is declared at the top, for __NetInetShutdown.)
+static int loopbackHoldLogCount = 0;
+
+static bool GetLoopbackTcpEnds(const InetSocket *inetSock, sockaddr_in *local, sockaddr_in *peer) {
+	if ((inetSock->type & PSP_NET_INET_SOCK_TYPE_MASK) != PSP_NET_INET_SOCK_STREAM)
+		return false;
+	socklen_t len = sizeof(*local);
+	if (getsockname(inetSock->sock, (sockaddr *)local, &len) != 0 || local->sin_family != AF_INET)
+		return false;
+	len = sizeof(*peer);
+	if (getpeername(inetSock->sock, (sockaddr *)peer, &len) != 0 || peer->sin_family != AF_INET)
+		return false;
+	return (ntohl(local->sin_addr.s_addr) >> 24) == 127 && (ntohl(peer->sin_addr.s_addr) >> 24) == 127;
+}
+
+// Drops the chunks whose delay has passed, and flows with nothing left.
+static void LoopbackPrune() {
+	const int now = __DisplayGetVCount();
+	for (auto it = loopbackHeld.begin(); it != loopbackHeld.end(); ) {
+		auto &chunks = it->second;
+		while (!chunks.empty() && now - chunks.front().sentVCount >= g_Config.iLoopbackLatencyVblanks)
+			chunks.pop_front();
+		if (chunks.empty())
+			it = loopbackHeld.erase(it);
+		else
+			++it;
+	}
+}
+
+static void LoopbackOnSend(int socket, const InetSocket *inetSock, int bytes) {
+	if (g_Config.iLoopbackLatencyVblanks <= 0 || bytes <= 0)
+		return;
+	sockaddr_in local{}, peer{};
+	if (!GetLoopbackTcpEnds(inetSock, &local, &peer))
+		return;
+	// Flows to sockets of other processes (another PPSSPP instance) are recorded too, but nobody reads them and
+	// they're pruned after N vblanks.
+	LoopbackPrune();
+	const int now = __DisplayGetVCount();
+	loopbackHeld[LoopbackFlowKey(local.sin_addr.s_addr, local.sin_port, peer.sin_addr.s_addr, peer.sin_port)].push_back({ now, bytes });
+	const int n = loopbackHoldLogCount++;
+	if (n < 20 || n % 200 == 0) {
+		INFO_LOG(Log::sceNet, "Loopback latency: socket %d sent %d bytes to %s:%d at vcount %d, readable from vcount %d", socket, bytes,
+			ip2str(peer.sin_addr).c_str(), ntohs(peer.sin_port), now, now + g_Config.iLoopbackLatencyVblanks);
+	}
+}
+
+// How many of the bytes queued on this socket the game may read now, or -1 if nothing is held back.
+static int LoopbackReadable(const InetSocket *inetSock) {
+	if (g_Config.iLoopbackLatencyVblanks <= 0 || loopbackHeld.empty())
+		return -1;
+	LoopbackPrune();
+	if (loopbackHeld.empty())
+		return -1;
+	sockaddr_in local{}, peer{};
+	if (!GetLoopbackTcpEnds(inetSock, &local, &peer))
+		return -1;
+	auto it = loopbackHeld.find(LoopbackFlowKey(peer.sin_addr.s_addr, peer.sin_port, local.sin_addr.s_addr, local.sin_port));
+	if (it == loopbackHeld.end())
+		return -1;
+	int held = 0;
+	for (const LoopbackChunk &chunk : it->second)
+		held += chunk.bytes;
+	// If some of the held bytes haven't reached the host buffer yet, this holds back older bytes instead, which only
+	// errs on the late side.
+	return std::max((int)getAvailToRecv(inetSock->sock) - held, 0);
+}
+
+// For select/poll: the host says the socket is readable, but everything queued is still held back.
+static bool LoopbackHidesRead(int socket) {
+	InetSocket *inetSock;
+	return g_socketManager.GetInetSocket(socket, &inetSock) && LoopbackReadable(inetSock) == 0;
+}
+
 // FIXME: nfds is number of fd(s) as in posix poll, or was it maximum fd value as in posix select? Star Wars Battlefront Renegade seems to set the nfds to 64, while Coded Arms Contagion is using 256
 int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr, u32 timeoutPtr) {
 	SceNetInetFdSet	*readfds = readfdsPtr ? (SceNetInetFdSet*)Memory::GetPointerWrite(readfdsPtr) : nullptr;
@@ -388,7 +486,10 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 				continue;
 			}
 			if (readfds && FD_ISSET(hostSockets[i], &rdfds)) {
-				NetInetFD_SET(i, readfds);
+				if (LoopbackHidesRead(i))
+					retval--;
+				else
+					NetInetFD_SET(i, readfds);
 			}
 			if (writefds && FD_ISSET(hostSockets[i], &wrfds)) {
 				NetInetFD_SET(i, writefds);
@@ -453,7 +554,7 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 	retval = 0;
 	for (int i = 0; i < (s32)nfds; i++) {
 		SOCKET hostSocket = g_socketManager.GetHostSocketFromInetSocket(fdarray[i].fd);
-		if ((fdarray[i].events & (INET_POLLRDNORM | INET_POLLIN)) && FD_ISSET(hostSocket, &readfds))
+		if ((fdarray[i].events & (INET_POLLRDNORM | INET_POLLIN)) && FD_ISSET(hostSocket, &readfds) && !LoopbackHidesRead(fdarray[i].fd))
 			fdarray[i].revents |= (INET_POLLRDNORM | INET_POLLIN); //POLLIN_SET
 		if ((fdarray[i].events & (INET_POLLWRNORM | INET_POLLOUT)) && FD_ISSET(hostSocket, &writefds))
 			fdarray[i].revents |= (INET_POLLWRNORM | INET_POLLOUT); //POLLOUT_SET
@@ -476,6 +577,14 @@ static int sceNetInetRecv(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
+	const int readable = LoopbackReadable(inetSock);
+	// Host sockets are always nonblocking here, so this is what an empty socket returns too.
+	if (readable == 0) {
+		UpdateErrnoFromHost(__KernelGetCurThread(), EAGAIN, __FUNCTION__);
+		return hleDelayResult(hleLogDebug(Log::sceNet, -1, "EAGAIN (loopback data held back)"), "workaround until blocking-socket", 500);
+	}
+	if (readable > 0)
+		bufLen = std::min(bufLen, (u32)readable);
 	int retval = recv(inetSock->sock, (char*)Memory::GetPointer(bufPtr), bufLen, flgs | MSG_NOSIGNAL);
 	if (g_Config.bNpP2PTrace) {
 		(retval < 0 ? p2pTrace.recvEagain : p2pTrace.recvOk)++;
@@ -514,6 +623,7 @@ static int sceNetInetSend(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 		UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__);
 		return hleLogError(Log::sceNet, retval);
 	}
+	LoopbackOnSend(socket, inetSock, retval);
 	return hleLogInfo(Log::sceNet, retval);
 }
 
@@ -997,6 +1107,14 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 		*srclen = std::min((*srclen) > 0 ? *srclen : 0, static_cast<socklen_t>(sizeof(saddr)));
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
+	const int readable = LoopbackReadable(inetSock);
+	// Host sockets are always nonblocking here, so this is what an empty socket returns too.
+	if (readable == 0) {
+		UpdateErrnoFromHost(__KernelGetCurThread(), EAGAIN, __FUNCTION__);
+		return hleDelayResult(hleLogDebug(Log::sceNet, -1, "EAGAIN (loopback data held back)"), "workaround until blocking-socket", 500);
+	}
+	if (readable > 0)
+		len = std::min(len, readable);
 	int retval = recvfrom(inetSock->sock, (char*)Memory::GetPointer(bufferPtr), len, flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, srclen);
 	if (g_Config.bNpP2PTrace) {
 		if (IsP2PSocket(inetSock)) {
@@ -1126,6 +1244,7 @@ static int sceNetInetSendto(int socket, u32 bufferPtr, int len, int flags, u32 t
 		}
 	}
 
+	LoopbackOnSend(socket, inetSock, retval);
 	return hleLogDebug(Log::sceNet, retval, "SendTo: Address = %s, Port = %d", ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 }
 
@@ -1324,6 +1443,7 @@ static int sceNetInetSendmsg(int socket, u32 msghdrPtr, int flags) {
 			return hleLogError(Log::sceNet, retval);
 		}
 	}
+	LoopbackOnSend(socket, inetSock, retval);
 	return hleLogInfo(Log::sceNet, retval); // returns number of bytes sent?
 }
 
