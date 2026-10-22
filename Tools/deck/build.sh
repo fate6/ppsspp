@@ -21,13 +21,18 @@ git fetch --force "$SRC" HEAD
 git checkout --force FETCH_HEAD
 REV=$(git rev-parse --short HEAD)
 
-for path in ext/SPIRV-Cross ext/aemu_postoffice ext/armips ext/cpu_features ext/discord-rpc \
+for path in ext/OpenXR-SDK ext/SPIRV-Cross ext/aemu_postoffice ext/armips ext/cpu_features ext/discord-rpc \
             ext/freetype ext/glslang ext/libchdr ext/lua ext/miniupnp ext/naett ext/nanosvg \
             ext/rapidjson ext/rcheevos ext/zstd ffmpeg assets/debugger; do
     name=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk -v p="$path" '$2==p {print $1}' | sed 's/^submodule\.//; s/\.path$//')
     git config "submodule.$name.url" "$SRC/$path"
     git submodule update --init --force "$path"
 done
+
+# Nested submodule armips needs (ext/filesystem), also from the local checkout.
+(cd ext/armips
+ git config submodule.ext/filesystem.url "$SRC/ext/armips/ext/filesystem"
+ git submodule update --init --force ext/filesystem)
 
 export CCACHE_DIR=/work/ccache
 cmake -S . -B build -G Ninja \
@@ -50,15 +55,9 @@ for lib in libSDL2-2.0.so.0 libSDL2_ttf-2.0.so.0; do
 done
 patchelf --set-rpath '$ORIGIN/lib' "$STAGE/PPSSPPSDL"
 
-cat > "$STAGE/ppsspp.sh" <<'EOF'
-#!/bin/bash
-# Portable launcher: config, memstick and saves live next to this script.
-HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-export XDG_CONFIG_HOME="$HERE/config"
-mkdir -p "$XDG_CONFIG_HOME/ppsspp/PSP/SYSTEM" "$XDG_CONFIG_HOME/ppsspp/PSP/SAVEDATA"
-exec "$HERE/PPSSPPSDL" "$@"
-EOF
-chmod +x "$STAGE/ppsspp.sh" "$STAGE/PPSSPPSDL"
+# Portable mode: the fork uses ./memstick when it exists (config in memstick/PSP/SYSTEM/ppsspp.ini).
+mkdir -p "$STAGE/memstick/PSP/SYSTEM" "$STAGE/memstick/PSP/SAVEDATA"
+chmod +x "$STAGE/PPSSPPSDL"
 echo "$REV" > "$STAGE/REVISION"
 
 mkdir -p "$OUT"
