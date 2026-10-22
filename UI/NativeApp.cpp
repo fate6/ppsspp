@@ -480,6 +480,11 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
 		config = "./config";
 
 	g_Config.memStickDirectory = Path(config) / "ppsspp";
+	// Portable mode (psp2i fork): a "memstick" folder next to the binary is used instead, as on Windows.
+	if (File::IsDirectory(File::GetExeDirectory() / "memstick")) {
+		g_Config.memStickDirectory = File::GetExeDirectory() / "memstick";
+		INFO_LOG(Log::System, "Portable memstick next to the binary: '%s'", g_Config.memStickDirectory.c_str());
+	}
 	g_Config.flash0Directory = File::GetExeDirectory() / "assets/flash0";
 	if (getenv("HOME") != nullptr) {
 		g_Config.defaultCurrentDirectory = Path(getenv("HOME"));
