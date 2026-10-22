@@ -307,6 +307,10 @@ static bool GetLoopbackTcpEnds(const InetSocket *inetSock, sockaddr_in *local, s
 	len = sizeof(*peer);
 	if (getpeername(inetSock->sock, (sockaddr *)peer, &len) != 0 || peer->sin_family != AF_INET)
 		return false;
+	// Both ends on this host: 127.x (NpLoopbackHost), or the same address on both ends. Without NpLoopbackHost
+	// (two machines on a LAN), the game connects to its own room server through its LAN IP.
+	if (local->sin_addr.s_addr == peer->sin_addr.s_addr)
+		return true;
 	return (ntohl(local->sin_addr.s_addr) >> 24) == 127 && (ntohl(peer->sin_addr.s_addr) >> 24) == 127;
 }
 
