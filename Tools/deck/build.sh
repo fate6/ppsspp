@@ -50,10 +50,13 @@ rm -rf /work/stage && mkdir -p "$STAGE/lib"
 cp build/PPSSPPSDL "$STAGE/"
 cp -r build/assets "$STAGE/"
 strip "$STAGE/PPSSPPSDL"
-for lib in libSDL2-2.0.so.0 libSDL2_ttf-2.0.so.0; do
+# SDL2 and SDL2_ttf, plus two libs Ubuntu's SDL2 links that SteamOS may not ship.
+for lib in libSDL2-2.0.so.0 libSDL2_ttf-2.0.so.0 libdecor-0.so.0 libXss.so.1; do
     cp -L "$(ldconfig -p | awk -v l="$lib" '$1==l {print $NF; exit}')" "$STAGE/lib/"
 done
-patchelf --set-rpath '$ORIGIN/lib' "$STAGE/PPSSPPSDL"
+# DT_RPATH, not RUNPATH: it beats LD_LIBRARY_PATH, which Steam sets to its runtime (older SDL2_ttf) for
+# non-Steam shortcuts. It also applies to the bundled libs' own dependencies.
+patchelf --force-rpath --set-rpath '$ORIGIN/lib' "$STAGE/PPSSPPSDL"
 
 # Portable mode: the fork uses ./memstick when it exists (config in memstick/PSP/SYSTEM/ppsspp.ini).
 mkdir -p "$STAGE/memstick/PSP/SYSTEM" "$STAGE/memstick/PSP/SAVEDATA"
