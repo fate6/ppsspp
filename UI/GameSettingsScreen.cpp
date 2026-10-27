@@ -1075,7 +1075,8 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 
 	networkingSettings->Add(new CheckBox(&g_Config.bEnableAdhocServer, n->T("Enable built-in ad hoc server")));
 
-	networkingSettings->Add(new ItemHeader(n->T("Infrastructure")));
+	// psp2i fork: the account the revival server checks at login (username + server-issued license code).
+	networkingSettings->Add(new ItemHeader(n->T("PSN account")));
 	if (g_Config.sInfrastructureUsername.empty()) {
 		networkingSettings->Add(new NoticeView(NoticeLevel::WARN, n->T("To play in Infrastructure Mode, you must enter a username"), ""))->SetWrapText(true);
 	}
@@ -1084,7 +1085,15 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	usernameChoice->OnChange.Add([this](UI::EventParams &e) {
 		RecreateViews();
 	});
+	static bool showLicense = false;
+	PopupTextInputChoice *licenseChoice = networkingSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sInfrastructureLicense, n->T("License code"), "XXXX-XXXX-XXXX-XXXX", 32, screenManager()));
+	if (!showLicense)
+		licenseChoice->SetPasswordDisplay();
+	networkingSettings->Add(new CheckBox(&showLicense, n->T("Show license code")))->OnClick.Add([this](UI::EventParams &e) {
+		RecreateViews();
+	});
 
+	networkingSettings->Add(new ItemHeader(n->T("Infrastructure")));
 	networkingSettings->Add(new CheckBox(&g_Config.bInfrastructureAutoDNS, n->T("Autoconfigure")));
 	auto *dnsServer = networkingSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sInfrastructureDNSServer, n->T("DNS server"), "", 32, screenManager()));
 	dnsServer->SetDisabledPtr(&g_Config.bInfrastructureAutoDNS);

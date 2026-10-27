@@ -566,6 +566,8 @@ public:
 	bool bAdhocServerShowPlayerPorts;
 	std::string sInfrastructureDNSServer;
 	std::string sInfrastructureUsername;  // Username used for Infrastructure play. Different restrictions.
+	std::string sInfrastructureLicense;  // Server-issued license code (XXXX-XXXX-XXXX-XXXX), sent in the NP ticket footer.
+	std::string sInfrastructureDeviceId;  // 20 random bytes as hex, made once per install. NP ticket body param 0.
 	std::string sNpMatching2Server;  // host:port of a matching server for sceNpMatching2. Empty = local fake backend.
 	std::string sNpLoopbackHost;  // 127.0.0.<n>: bind game sockets to this address (several instances on one PC). Empty = off.
 	bool bNpP2PTrace;  // Log every P2P datagram with its payload, plus per-second counts of the game's socket polling.

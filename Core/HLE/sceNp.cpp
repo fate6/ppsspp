@@ -18,6 +18,8 @@
 // This is pretty much a stub implementation. Doesn't actually do anything, just tries to return values
 // to keep games happy anyway.
 
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <deque>
 
@@ -428,6 +430,33 @@ int sceNpAuthGetTicket(u32 requestId, u32 bufferAddr, u32 length) {
 		return hleLogError(Log::sceNet, SCE_NP_AUTH_ERROR_UNKNOWN, "Missing npOnlineId");
 	}
 
+	// psp2i fork: the revival server reads the install's device ID from body param 0 and, when footer param 0
+	// is "LIC1", the license code from footer param 1. The game only passes the ticket on as a blob (it never
+	// calls sceNpAuthGetTicketParam), so the size and layout stay as they were.
+	char deviceId[20];
+	memcpy(deviceId, "\x4c\x47\x56\x3b\x81\x39\x4a\x22\xd8\x6b\xc1\x57\x71\x6e\xfd\xb8\xab\x63\xcc\x51", 20);
+	const std::string &idHex = g_Config.sInfrastructureDeviceId;
+	if (idHex.size() == 40) {
+		for (int i = 0; i < 20; i++)
+			deviceId[i] = (char)strtoul(idHex.substr(i * 2, 2).c_str(), nullptr, 16);
+	}
+	std::string license;
+	for (char c : g_Config.sInfrastructureLicense) {
+		if (c != ' ' && c != '-')
+			license += (char)toupper((unsigned char)c);
+	}
+	char footerTag[4] = { '\x34', '\xcd', '\x3c', '\xa9' };
+	char footerData[20];
+	memcpy(footerData, "\x3a\x4b\x42\x66\x92\xda\x6b\x7c\xb7\x4c\xe8\xd9\x4f\x2b\x77\x15\x91\xb8\xa4\xa9", 20);
+	if (!license.empty()) {
+		if (license.size() != 16)
+			WARN_LOG(Log::sceNet, "InfrastructureLicense is %d characters after removing dashes and spaces, expected 16", (int)license.size());
+		memcpy(footerTag, "LIC1", 4);
+		memset(footerData, 0, sizeof(footerData));
+		memcpy(footerData, license.data(), std::min(license.size(), sizeof(footerData)));
+	}
+	INFO_LOG(Log::sceNet, "NP ticket: device ID %s, license %s", idHex.c_str(), license.empty() ? "none" : "set");
+
 	int result = length;
 	Memory::Memset(bufferAddr, 0, length, "NpAuthGetTicket");
 	SceNpTicket ticket = {};
@@ -436,7 +465,7 @@ int sceNpAuthGetTicket(u32 requestId, u32 bufferAddr, u32 length) {
 	ticket.header.size = 0xF0; // size excluding the header
 	u8* buf = Memory::GetPointerWrite(bufferAddr + sizeof(ticket));
 	int ofs = 0;
-	ofs += writeTicketParam(buf, PARAM_TYPE_STRING_ASCII, "\x4c\x47\x56\x3b\x81\x39\x4a\x22\xd8\x6b\xc1\x57\x71\x6e\xfd\xb8\xab\x63\xcc\x51", 20); // 20 random letters, token key or SceNpSignature?
+	ofs += writeTicketParam(buf, PARAM_TYPE_STRING_ASCII, deviceId, 20); // 20 random letters, token key or SceNpSignature? (fork: device ID)
 	ofs += writeTicketU32Param(buf + ofs, PARAM_TYPE_INT, 0x0100); // a flags?
 	PSPTimeval tv; //npSigninTimestamp
 	__RtcTimeOfDay(&tv);
@@ -462,8 +491,8 @@ int sceNpAuthGetTicket(u32 requestId, u32 bufferAddr, u32 length) {
 	SceNpTicketSection footer = { SECTION_TYPE_FOOTER, 32 }; // footer section? ie. 32-bytes on version 2.1 containing 4-chars ASCII + 20-chars ASCII
 	Memory::Memcpy(bufferAddr + sizeof(ticket) + ofs, &footer, sizeof(SceNpTicketSection), "NpAuthGetTicket");
 	ofs += sizeof(footer);
-	ofs += writeTicketParam(buf + ofs, PARAM_TYPE_STRING_ASCII, "\x34\xcd\x3c\xa9", 4);
-	ofs += writeTicketParam(buf + ofs, PARAM_TYPE_STRING_ASCII, "\x3a\x4b\x42\x66\x92\xda\x6b\x7c\xb7\x4c\xe8\xd9\x4f\x2b\x77\x15\x91\xb8\xa4\xa9", 20); // 20 random letters, token key or SceNpSignature?
+	ofs += writeTicketParam(buf + ofs, PARAM_TYPE_STRING_ASCII, footerTag, 4); // fork: "LIC1" when a license is set
+	ofs += writeTicketParam(buf + ofs, PARAM_TYPE_STRING_ASCII, footerData, 20); // 20 random letters, token key or SceNpSignature? (fork: license code, NUL-padded)
 	// includes Language list?
 	Memory::Memset(bufferAddr + sizeof(ticket) + ofs, 0, 36);
 

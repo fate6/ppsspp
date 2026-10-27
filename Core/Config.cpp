@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <random>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -642,6 +643,18 @@ static std::string DefaultInfrastructureUsername() {
 	return std::string();
 }
 
+static bool IsValidDeviceId(const std::string &id) {
+	return id.size() == 40 && id.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+}
+
+static std::string NewDeviceId() {
+	std::random_device rd;
+	std::string id;
+	for (int i = 0; i < 20; i++)
+		id += StringFromFormat("%02x", rd() & 0xFF);
+	return id;
+}
+
 bool DisplayLayoutConfig::InternalRotationIsPortrait() const {
 	return (iInternalScreenRotation == ROTATION_LOCKED_VERTICAL || iInternalScreenRotation == ROTATION_LOCKED_VERTICAL180) && !g_Config.bSkipBufferEffects;
 }
@@ -1061,6 +1074,8 @@ static const ConfigSetting networkSettings[] = {
 	ConfigSetting("EnableUPnP", SETTING(g_Config, bEnableUPnP), false, CfgFlag::PER_GAME),
 	ConfigSetting("UPnPUseOriginalPort", SETTING(g_Config, bUPnPUseOriginalPort), false, CfgFlag::PER_GAME),
 	ConfigSetting("InfrastructureUsername", SETTING(g_Config, sInfrastructureUsername), &DefaultInfrastructureUsername, CfgFlag::PER_GAME),
+	ConfigSetting("InfrastructureLicense", SETTING(g_Config, sInfrastructureLicense), "", CfgFlag::PER_GAME),
+	ConfigSetting("InfrastructureDeviceId", SETTING(g_Config, sInfrastructureDeviceId), "", CfgFlag::DEFAULT),
 	ConfigSetting("NpMatching2Server", SETTING(g_Config, sNpMatching2Server), "", CfgFlag::PER_GAME),
 	ConfigSetting("NpLoopbackHost", SETTING(g_Config, sNpLoopbackHost), "", CfgFlag::PER_GAME),
 	ConfigSetting("NpP2PTrace", SETTING(g_Config, bNpP2PTrace), false, CfgFlag::PER_GAME),
@@ -1332,12 +1347,24 @@ void Config::Load(const char *iniFileName, const char *controllerIniFilename) {
 	bSaveSettings = true;
 
 	IniFile iniFile;
-	if (!iniFile.Load(iniFilename_)) {
+	const bool iniLoaded = iniFile.Load(iniFilename_);
+	if (!iniLoaded) {
 		WARN_LOG(Log::Loader, "Failed to read '%s'. Setting main config to default.", iniFilename_.c_str());
 		// Continue anyway to initialize the config.
 	}
 
 	ReadAllSettings(iniFile);
+
+	// The device ID is made once per install and written straight away: Save() skips secondary instances
+	// (instance_b usually runs second), so waiting for it would give that install a new ID every run.
+	if (!IsValidDeviceId(sInfrastructureDeviceId)) {
+		sInfrastructureDeviceId = NewDeviceId();
+		iniFile.GetOrCreateSection("Network")->Set("InfrastructureDeviceId", sInfrastructureDeviceId);
+		// Only over an ini we could read (or none at all), never over one that failed to load.
+		if ((!iniLoaded && File::Exists(iniFilename_)) || !iniFile.Save(iniFilename_))
+			WARN_LOG(Log::Loader, "Couldn't save the new InfrastructureDeviceId to '%s'", iniFilename_.c_str());
+		INFO_LOG(Log::Loader, "New InfrastructureDeviceId %s", sInfrastructureDeviceId.c_str());
+	}
 
 	iRunCount++;
 
