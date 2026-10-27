@@ -70,6 +70,7 @@
 #include "Common/StringUtils.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
+#include "Core/ELF/ParamSFO.h"
 #include "Core/KeyMap.h"
 #include "Core/TiltEventProcessor.h"
 #include "Core/Instance.h"
@@ -1085,11 +1086,14 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	usernameChoice->OnChange.Add([this](UI::EventParams &e) {
 		RecreateViews();
 	});
+	// The license field is generic; PSP2i calls its code the "Infinity License" (インフィニティ・ライセンス).
+	const std::string licenseGameId = !gameID_.empty() ? gameID_ : (PSP_IsInited() ? g_paramSFO.GetDiscID() : std::string());
+	const bool isPsp2i = licenseGameId == "NPJH50332";
 	static bool showLicense = false;
-	PopupTextInputChoice *licenseChoice = networkingSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sInfrastructureLicense, n->T("License code"), "XXXX-XXXX-XXXX-XXXX", 32, screenManager()));
+	PopupTextInputChoice *licenseChoice = networkingSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sInfrastructureLicense, isPsp2i ? n->T("Infinity License") : n->T("License code"), "XXXX-XXXX-XXXX-XXXX", 32, screenManager()));
 	if (!showLicense)
 		licenseChoice->SetPasswordDisplay();
-	networkingSettings->Add(new CheckBox(&showLicense, n->T("Show license code")))->OnClick.Add([this](UI::EventParams &e) {
+	networkingSettings->Add(new CheckBox(&showLicense, isPsp2i ? n->T("Show Infinity License") : n->T("Show license code")))->OnClick.Add([this](UI::EventParams &e) {
 		RecreateViews();
 	});
 
