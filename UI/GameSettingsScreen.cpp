@@ -322,8 +322,8 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 			choice->HideChoice((int)GPUBackend::VULKAN);
 	});
 
-	if (!IsFirstInstance()) {
-		// If we're not the first instance, can't save the setting, and it requires a restart, so...
+	if (!CanSaveConfig()) {
+		// If we can't save the setting (another instance owns this ini), and it requires a restart, so...
 		renderingBackendChoice->SetEnabled(false);
 	}
 #endif

@@ -27,6 +27,15 @@ void InitInstanceCounter();
 void ShutdownInstanceCounter();
 int GetInstancePeerCount();
 
+#include <string>
+
 inline bool IsFirstInstance() {
 	return PPSSPP_ID == 1;
 }
+
+// psp2i fork: claims the config file (call once its path is known). Only one running PPSSPP can own a given
+// ini, so separate installs (instance_b, its own memstick) each save their config even when they aren't the
+// first instance.
+void ClaimConfigFile(const std::string &iniPath);
+// The first instance, or the one that owns this config file.
+bool CanSaveConfig();

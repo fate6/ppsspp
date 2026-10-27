@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #endif
 
 #if PPSSPP_PLATFORM(WINDOWS)
@@ -33,7 +34,10 @@
 #include "Common/Log.h"
 #include "Common/SysError.h"
 
+#include <cctype>
 #include <cstdint>
+#include <cwchar>
+#include <functional>
 
 uint8_t PPSSPP_ID = 0;
 
@@ -163,6 +167,36 @@ void InitInstanceCounter() {
 	if (!success) {
 		PPSSPP_ID = 1;
 	}
+}
+
+static bool configClaimed = false;
+static bool ownsConfigFile = false;
+
+void ClaimConfigFile(const std::string &iniPath) {
+	if (configClaimed)
+		return;
+	configClaimed = true;
+#if PPSSPP_PLATFORM(WINDOWS)
+	// A named mutex per ini path (paths are case-insensitive here). Never closed: it goes with the process.
+	std::string key = iniPath;
+	for (char &c : key)
+		c = (c == '/') ? '\\' : (char)tolower((unsigned char)c);
+	wchar_t name[64];
+	swprintf(name, ARRAYSIZE(name), L"PPSSPP_config_%016llx", (unsigned long long)std::hash<std::string>()(key));
+	HANDLE h = CreateMutexW(nullptr, FALSE, name);
+	ownsConfigFile = h != nullptr && GetLastError() != ERROR_ALREADY_EXISTS;
+#elif PPSSPP_PLATFORM(ANDROID) || defined(__LIBRETRO__) || PPSSPP_PLATFORM(SWITCH)
+	ownsConfigFile = false;
+#else
+	// An flock on <ini>.lock, held until exit.
+	int fd = open((iniPath + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+	ownsConfigFile = fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0;
+#endif
+	INFO_LOG(Log::Loader, "Config file %s: %s", iniPath.c_str(), ownsConfigFile ? "owned by this instance" : "in use by another instance (or no lock)");
+}
+
+bool CanSaveConfig() {
+	return IsFirstInstance() || ownsConfigFile;
 }
 
 void ShutdownInstanceCounter() {

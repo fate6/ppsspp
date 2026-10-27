@@ -1342,6 +1342,7 @@ void Config::Load(const char *iniFileName, const char *controllerIniFilename) {
 	g_DownloadManager.SetUserAgent(StringFromFormat("PPSSPP/%s", PPSSPP_GIT_VERSION));
 
 	UpdateIniLocation(iniFileName, controllerIniFilename);
+	ClaimConfigFile(iniFilename_.ToString());
 
 	INFO_LOG(Log::Loader, "Loading config: %s", iniFilename_.c_str());
 	bSaveSettings = true;
@@ -1473,10 +1474,9 @@ bool Config::ShouldSaveSetting(const void *ptr) const {
 // * Then, save the NON-game-specific settings ONLY to the regular ini file!
 bool Config::Save(const char *saveReason) {
 	double startTime = time_now_d();
-	if (!IsFirstInstance()) {
-		// TODO: Should we allow saving config if started from a different directory?
-		// How do we tell?
-		WARN_LOG(Log::Loader, "Not saving config - secondary instances don't.");
+	if (!CanSaveConfig()) {
+		// psp2i fork: a secondary instance with its own ini (another install / memstick) does save; see ClaimConfigFile.
+		WARN_LOG(Log::Loader, "Not saving config - another instance is using the same ini.");
 		// Don't want to retry or something.
 		return true;
 	}
