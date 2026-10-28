@@ -1192,6 +1192,9 @@
     <ClCompile Include="HLE\NpMatching2Backend.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
+    <ClCompile Include="HLE\NpRelay.cpp">
+      <Filter>HLE\Libraries</Filter>
+    </ClCompile>
     <ClCompile Include="WaveFile.cpp">
       <Filter>Core</Filter>
     </ClCompile>
@@ -2125,6 +2128,9 @@
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
     <ClInclude Include="HLE\NpMatching2Backend.h">
+      <Filter>HLE\Libraries</Filter>
+    </ClInclude>
+    <ClInclude Include="HLE\NpRelay.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
     <ClInclude Include="WaveFile.h">

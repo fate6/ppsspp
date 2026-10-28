@@ -160,6 +160,7 @@
     <ClInclude Include="..\..\Core\HLE\sceNetResolver.h" />
     <ClInclude Include="..\..\Core\HLE\sceNp2.h" />
     <ClInclude Include="..\..\Core\HLE\NpMatching2Backend.h" />
+    <ClInclude Include="..\..\Core\HLE\NpRelay.h" />
     <ClInclude Include="..\..\Core\HLE\sceReg.h" />
     <ClInclude Include="..\..\Core\HLE\SocketManager.h" />
     <ClInclude Include="..\..\Core\HW\GranularMixer.h" />
@@ -432,6 +433,7 @@
     <ClCompile Include="..\..\Core\HLE\sceNetResolver.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceNp2.cpp" />
     <ClCompile Include="..\..\Core\HLE\NpMatching2Backend.cpp" />
+    <ClCompile Include="..\..\Core\HLE\NpRelay.cpp" />
     <ClCompile Include="..\..\Core\HLE\sceReg.cpp" />
     <ClCompile Include="..\..\Core\HLE\SocketManager.cpp" />
     <ClCompile Include="..\..\Core\HW\GranularMixer.cpp" />

@@ -1079,6 +1079,7 @@ static const ConfigSetting networkSettings[] = {
 	ConfigSetting("NpMatching2Server", SETTING(g_Config, sNpMatching2Server), "", CfgFlag::PER_GAME),
 	ConfigSetting("NpLoopbackHost", SETTING(g_Config, sNpLoopbackHost), "", CfgFlag::PER_GAME),
 	ConfigSetting("NpP2PTrace", SETTING(g_Config, bNpP2PTrace), false, CfgFlag::PER_GAME),
+	ConfigSetting("NpRelay", SETTING(g_Config, bNpRelay), true, CfgFlag::PER_GAME),
 	ConfigSetting("LoopbackLatencyVblanks", SETTING(g_Config, iLoopbackLatencyVblanks), 6, CfgFlag::PER_GAME),
 	ConfigSetting("InfrastructureAutoDNS", SETTING(g_Config, bInfrastructureAutoDNS), true, CfgFlag::PER_GAME),
 	ConfigSetting("AllowSavestateWhileConnected", SETTING(g_Config, bAllowSavestateWhileConnected), false, CfgFlag::DONT_SAVE),

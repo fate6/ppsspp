@@ -571,6 +571,7 @@ public:
 	std::string sNpMatching2Server;  // host:port of a matching server for sceNpMatching2. Empty = local fake backend.
 	std::string sNpLoopbackHost;  // 127.0.0.<n>: bind game sockets to this address (several instances on one PC). Empty = off.
 	bool bNpP2PTrace;  // Log every P2P datagram with its payload, plus per-second counts of the game's socket polling.
+	bool bNpRelay;  // Offer the matching server to relay peer traffic (10.92.0.0/16 virtual addresses) when peers can't reach each other.
 	int iLoopbackLatencyVblanks;  // TCP data between two of this instance's own sockets is readable only this many vblanks after the send. 0 = off.
 	bool bInfrastructureAutoDNS;
 	bool bAllowSavestateWhileConnected;  // Developer option, ini-only. No normal users need this, it's always wrong to save/load state when online.

@@ -40,6 +40,7 @@
 #include "Core/MemMapHelpers.h"
 #include "Core/System.h"
 #include "Core/HLE/NpMatching2Backend.h"
+#include "Core/HLE/NpRelay.h"
 #include "Core/HLE/sceNp.h"
 #include "Core/HLE/sceNp2.h"
 #include "Core/HLE/sceRtc.h"
@@ -186,10 +187,101 @@ static const u32 MAX_FRAME = 256 * 1024;
 static const double CONNECT_TIMEOUT_S = 5.0;
 static const int HELLO_TIMEOUT_MS = 5000;
 
+static const u16 FRAME_FLAG_RAW = 0x0001;  // binary body (relay data), not JSON
+
 struct Frame {
 	u16 type;
 	u32 seq;
 	std::string body;
+};
+
+// What the frames travel over. A frame here is everything after the length field: {u16 type; u16 flags; u32 seq;
+// body}. TCP carries them length-prefixed in one byte stream; a WebSocket transport would carry one per message.
+class NpMatching2Transport {
+public:
+	virtual ~NpMatching2Transport() {}
+	virtual bool Connect(const std::string &host, int port) = 0;
+	// Callers serialize writes; a write may run while ReadFrame blocks on another thread.
+	virtual bool WriteFrame(const std::string &frame) = 0;
+	// Blocks until a whole frame is in, or the connection ends (false).
+	virtual bool ReadFrame(std::string *frame) = 0;
+	// Makes a blocked ReadFrame return.
+	virtual void Shutdown() = 0;
+	virtual void Close() = 0;
+};
+
+class TcpTransport : public NpMatching2Transport {
+public:
+	bool Connect(const std::string &host, int port) override {
+		conn_ = std::make_unique<net::Connection>(nullptr);
+		if (!conn_->Resolve(host.c_str(), port, net::DNSType::IPV4) || !conn_->Connect(1, CONNECT_TIMEOUT_S)) {
+			conn_.reset();
+			return false;
+		}
+		sock_ = (SOCKET)conn_->sock();
+		fd_util::SetNonBlocking((int)sock_, false);
+		int one = 1;
+		setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+		return true;
+	}
+
+	bool WriteFrame(const std::string &frame) override {
+		const u32 length = (u32)frame.size();
+		std::string out((const char *)&length, 4);
+		out += frame;
+		return SendAll(out.data(), out.size());
+	}
+
+	bool ReadFrame(std::string *frame) override {
+		u32 length;
+		if (!RecvAll((char *)&length, 4))
+			return false;
+		if (length < 8 || length > MAX_FRAME) {
+			ERROR_LOG(Log::sceNet, "NpMatching2 (network): bad frame length %u", length);
+			return false;
+		}
+		frame->resize(length);
+		return RecvAll(&(*frame)[0], length);
+	}
+
+	void Shutdown() override {
+		if (conn_)
+			shutdown(sock_, SD_BOTH);
+	}
+
+	void Close() override {
+		if (conn_) {
+			conn_->Disconnect();
+			conn_.reset();
+		}
+		sock_ = INVALID_SOCKET;
+	}
+
+private:
+	bool SendAll(const char *data, size_t size) {
+		while (size > 0) {
+			int n = send(sock_, data, (int)size, MSG_NOSIGNAL);
+			if (n <= 0)
+				return false;
+			data += n;
+			size -= n;
+		}
+		return true;
+	}
+
+	bool RecvAll(char *buf, size_t size) {
+		size_t got = 0;
+		while (got < size) {
+			int n = recv(sock_, buf + got, (int)(size - got), 0);
+			if (n <= 0)
+				return false;
+			got += n;
+		}
+		return true;
+	}
+
+	std::unique_ptr<net::Connection> conn_;
+	SOCKET sock_ = INVALID_SOCKET;
 };
 
 u64 JsonNum(const json::JsonGet &g, const char *name, u64 def = 0) {
@@ -323,16 +415,12 @@ public:
 			port = atoi(server_.c_str() + colon + 1);
 		}
 
-		conn_ = std::make_unique<net::Connection>(nullptr);
-		if (!conn_->Resolve(host.c_str(), port, net::DNSType::IPV4) || !conn_->Connect(1, CONNECT_TIMEOUT_S)) {
+		transport_ = std::make_unique<TcpTransport>();
+		if (!transport_->Connect(host, port)) {
 			ERROR_LOG(Log::sceNet, "NpMatching2 (network): can't connect to %s", server_.c_str());
-			conn_.reset();
+			transport_.reset();
 			return SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE;
 		}
-		sock_ = (SOCKET)conn_->sock();
-		fd_util::SetNonBlocking((int)sock_, false);
-		int one = 1;
-		setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 
 		helloDone_ = false;
 		connected_ = true;
@@ -348,6 +436,8 @@ public:
 		w.writeString("onlineId", std::string(npId.handle.data, strnlen(npId.handle.data, sizeof(npId.handle.data))));
 		if (!g_Config.sNpLoopbackHost.empty())
 			w.writeString("localAddr", g_Config.sNpLoopbackHost);
+		if (g_Config.bNpRelay)
+			w.writeUint("relay", 1);
 		w.end();
 		if (!SendFrame(MSG_HELLO, 1, w.str())) {
 			Disconnect();
@@ -396,6 +486,7 @@ public:
 		}
 		INFO_LOG(Log::sceNet, "NpMatching2 (network): connected to %s as user %llu, %d server(s), public address %s",
 			server_.c_str(), (unsigned long long)JsonNum(root, "userId"), (int)servers_.size(), JsonStr(root, "publicAddr").c_str());
+		StartRelay(JsonStr(root, "vaddr"), JsonStr(root, "relayNet"));
 		return 0;
 	}
 
@@ -622,6 +713,23 @@ public:
 private:
 	using ResponseHandler = std::function<void(int err, const json::JsonGet &body)>;
 
+	// HelloOk carries vaddr and relayNet ("10.92.0.0/16") when the server relays for us (matching-protocol.md §6).
+	void StartRelay(const std::string &vaddr, const std::string &relayNet) {
+		if (vaddr.empty())
+			return;
+		in_addr addr{}, net{};
+		const size_t slash = relayNet.find('/');
+		const int prefix = slash == std::string::npos ? -1 : atoi(relayNet.c_str() + slash + 1);
+		if (inet_pton(AF_INET, vaddr.c_str(), &addr) != 1 || inet_pton(AF_INET, relayNet.substr(0, slash).c_str(), &net) != 1 || prefix <= 0 || prefix > 32) {
+			ERROR_LOG(Log::sceNet, "NpMatching2 (network): bad relay address %s / %s", vaddr.c_str(), relayNet.c_str());
+			return;
+		}
+		const u32 mask = htonl(prefix == 32 ? 0xFFFFFFFF : ~(0xFFFFFFFFu >> prefix));
+		NpRelay::Start(addr.s_addr, net.s_addr, mask, [this](u16 type, u16 flags, u32 seq, const char *body, size_t size) {
+			return SendFrame(type, seq, std::string(body, size), flags);
+		});
+	}
+
 	void RoomResponse(int err, const json::JsonGet &body, const NpMatching2RoomDone &done) {
 		NpMatching2Room room;
 		if (err >= 0) {
@@ -743,59 +851,37 @@ private:
 		rooms_.clear();
 	}
 
-	bool SendFrame(u16 type, u32 seq, const std::string &body) {
-		std::string frame(12, '\0');
-		const u32 length = 8 + (u32)body.size();
-		const u16 flags = 0;
-		memcpy(&frame[0], &length, 4);
-		memcpy(&frame[4], &type, 2);
-		memcpy(&frame[6], &flags, 2);
-		memcpy(&frame[8], &seq, 4);
+	bool SendFrame(u16 type, u32 seq, const std::string &body, u16 flags = 0) {
+		std::string frame(8, '\0');
+		memcpy(&frame[0], &type, 2);
+		memcpy(&frame[2], &flags, 2);
+		memcpy(&frame[4], &seq, 4);
 		frame += body;
 
 		std::lock_guard<std::mutex> guard(sendMutex_);
-		if (!connected_)
-			return false;
-		size_t sent = 0;
-		while (sent < frame.size()) {
-			int n = send(sock_, frame.data() + sent, (int)(frame.size() - sent), 0);
-			if (n <= 0)
-				return false;
-			sent += n;
-		}
-		return true;
-	}
-
-	bool RecvAll(char *buf, size_t size) {
-		size_t got = 0;
-		while (got < size) {
-			int n = recv(sock_, buf + got, (int)(size - got), 0);
-			if (n <= 0)
-				return false;
-			got += n;
-		}
-		return true;
+		return connected_ && transport_->WriteFrame(frame);
 	}
 
 	void ReaderLoop() {
 		SetCurrentThreadName("NpMatching2Net");
+		std::string rest;
 		while (connected_) {
-			char head[12];
-			if (!RecvAll(head, 4))
-				break;
-			u32 length;
-			memcpy(&length, head, 4);
-			if (length < 8 || length > MAX_FRAME) {
-				ERROR_LOG(Log::sceNet, "NpMatching2 (network): bad frame length %u", length);
-				break;
-			}
-			std::string rest(length, '\0');
-			if (!RecvAll(&rest[0], length))
+			if (!transport_->ReadFrame(&rest))
 				break;
 			Frame frame;
+			u16 flags;
 			memcpy(&frame.type, &rest[0], 2);
+			memcpy(&flags, &rest[2], 2);
 			memcpy(&frame.seq, &rest[4], 4);
 			frame.body = rest.substr(8);
+
+			// Relay frames are handled here, off the emu thread (NpRelay.h).
+			if (NpRelay::HandleFrame(frame.type, flags, frame.seq, frame.body))
+				continue;
+			if (flags & FRAME_FLAG_RAW) {
+				WARN_LOG(Log::sceNet, "NpMatching2 (network): unexpected raw frame %04x", frame.type);
+				continue;
+			}
 			if (frame.body.empty())
 				frame.body = "{}";
 
@@ -818,27 +904,28 @@ private:
 			helloCv_.notify_all();
 		}
 		if (wasConnected) {
+			NpRelay::Stop();
 			std::lock_guard<std::mutex> guard(inboxMutex_);
 			inbox_.push_back({ MSG_CONNECTION_LOST, 0, "{}" });
 		}
 	}
 
 	void Disconnect() {
-		if (conn_)
+		if (transport_)
 			INFO_LOG(Log::sceNet, "NpMatching2 (network): disconnecting from %s", server_.c_str());
 		{
 			std::lock_guard<std::mutex> guard(sendMutex_);
 			connected_ = false;
-			if (conn_)
-				shutdown(sock_, SD_BOTH);
+			if (transport_)
+				transport_->Shutdown();
 		}
+		NpRelay::Stop();
 		if (reader_.joinable())
 			reader_.join();
-		if (conn_) {
-			conn_->Disconnect();
-			conn_.reset();
+		if (transport_) {
+			transport_->Close();
+			transport_.reset();
 		}
-		sock_ = INVALID_SOCKET;
 		{
 			std::lock_guard<std::mutex> guard(inboxMutex_);
 			inbox_.clear();
@@ -853,8 +940,7 @@ private:
 	}
 
 	std::string server_;
-	std::unique_ptr<net::Connection> conn_;
-	SOCKET sock_ = INVALID_SOCKET;
+	std::unique_ptr<NpMatching2Transport> transport_;
 	std::atomic<bool> connected_{ false };
 	std::thread reader_;
 	std::mutex sendMutex_;

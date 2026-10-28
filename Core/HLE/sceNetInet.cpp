@@ -2,6 +2,7 @@
 #include <deque>
 #include <map>
 #include <tuple>
+#include <vector>
 #include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
 #include "Common/Net/SocketCompat.h"
@@ -20,6 +21,7 @@
 #include "Core/HLE/sceNp.h"
 #include "Core/HLE/sceNp2.h"
 #include "Core/HLE/NetInetConstants.h"
+#include "Core/HLE/NpRelay.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/HW/Display.h"
 #include "Core/Config.h"
@@ -78,6 +80,7 @@ void __NetInetShutdown() {
 	}
 
 	netInetInited = false;
+	NpRelay::SocketsReset();
 	g_socketManager.CloseAll();
 	g_inetLastErrno.clear();
 	loopbackHeld.clear();
@@ -169,6 +172,8 @@ static u32_le sceNetInetInetAddr(const char *hostname) {
 	return hleLogDebug(Log::sceNet, retval);
 }
 
+static void WritePspSockaddr(u32 addrPtr, u32 addrLenPtr, u32 ip, u16 port);
+
 static int sceNetInetGetpeername(int socket, u32 namePtr, u32 namelenPtr) {
 	if (!Memory::IsValidAddress(namePtr) || !Memory::IsValidAddress(namelenPtr)) {
 		UpdateErrnoFromHost(__KernelGetCurThread(), EFAULT, __FUNCTION__);
@@ -178,6 +183,13 @@ static int sceNetInetGetpeername(int socket, u32 namePtr, u32 namelenPtr) {
 	InetSocket *inetSock;
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
 		return hleLogError(Log::sceNet, ERROR_INET_EBADF, "Bad socket #%d", socket);
+	}
+
+	u32 relayPeer;
+	u16 relayPeerPort;
+	if (NpRelay::GetPeer(socket, &relayPeer, &relayPeerPort)) {
+		WritePspSockaddr(namePtr, namelenPtr, relayPeer, relayPeerPort);
+		return hleLogInfo(Log::sceNet, 0, "relayed peer %s:%d", ip2str(*(in_addr *)&relayPeer).c_str(), relayPeerPort);
 	}
 
 	SceNetInetSockaddr* name = (SceNetInetSockaddr*)Memory::GetPointer(namePtr);
@@ -373,6 +385,50 @@ static bool LoopbackHidesRead(int socket) {
 	return g_socketManager.GetInetSocket(socket, &inetSock) && LoopbackReadable(inetSock) == 0;
 }
 
+// ---- Peers behind the matching server's relay (NpRelay.h): their virtual addresses (10.92.x.y) are handled here
+// instead of by the host network.
+
+static bool IsHostDgram(SOCKET sock) {
+	int hostType = 0;
+	socklen_t len = sizeof(hostType);
+	return getsockopt(sock, SOL_SOCKET, SO_TYPE, (char *)&hostType, &len) == 0 && hostType == SOCK_DGRAM;
+}
+
+// The port the game knows a socket by: the one it bound (P2P sockets may really sit on another, see Bind).
+static u16 GameLocalPort(int socket, const InetSocket *inetSock) {
+	if (inetSock->port != 0)
+		return (u16)inetSock->port;
+	sockaddr_in local{};
+	socklen_t len = sizeof(local);
+	if (getsockname(inetSock->sock, (sockaddr *)&local, &len) == 0 && local.sin_port != 0)
+		return ntohs(local.sin_port);
+	return (u16)(49152 + socket);  // never bound: any port will do, the peer only sees it
+}
+
+static void WritePspSockaddr(u32 addrPtr, u32 addrLenPtr, u32 ip, u16 port) {
+	SceNetInetSockaddr *name = (SceNetInetSockaddr *)Memory::GetPointerWrite(addrPtr);
+	if (!name)
+		return;
+	SockAddrIN4 saddr{};
+	saddr.in.sin_family = AF_INET;
+	saddr.in.sin_port = htons(port);
+	saddr.in.sin_addr.s_addr = ip;
+	name->sa_len = (u8)sizeof(SceNetInetSockaddrIn);
+	name->sa_family = AF_INET;
+	memcpy(name->sa_data, saddr.addr.sa_data, sizeof(name->sa_data));
+	if (u32 *len = (u32 *)Memory::GetPointerWrite(addrLenPtr))
+		*len = sizeof(SceNetInetSockaddrIn);
+}
+
+// The error a relayed TCP socket reports once the relay refused or dropped it, else 0 (host errno).
+static int RelayFailure(int socket) {
+	switch (NpRelay::SocketStatus(socket)) {
+	case NpRelay::Status::Refused: return ECONNREFUSED;
+	case NpRelay::Status::Reset: return ECONNRESET;
+	default: return 0;
+	}
+}
+
 // FIXME: nfds is number of fd(s) as in posix poll, or was it maximum fd value as in posix select? Star Wars Battlefront Renegade seems to set the nfds to 64, while Coded Arms Contagion is using 256
 int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr, u32 timeoutPtr) {
 	SceNetInetFdSet	*readfds = readfdsPtr ? (SceNetInetFdSet*)Memory::GetPointerWrite(readfdsPtr) : nullptr;
@@ -400,6 +456,25 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 	// Save the mapping during setup.
 	SOCKET hostSockets[256]{};
 
+	// Relayed sockets: queued datagrams and connections are readable; a connect the relay hasn't answered isn't
+	// writable yet, a refused or dropped one is (its error shows on the next call).
+	bool relayRead[256]{}, relayWrite[256]{}, relayHideWrite[256]{};
+	int relayReady = 0;
+	for (int i = SocketManager::MIN_VALID_INET_SOCKET; i < nfds; i++) {
+		if (readfds && NetInetFD_ISSET(i, readfds) && NpRelay::Readable(i)) {
+			relayRead[i] = true;
+			relayReady++;
+		}
+		if (writefds && NetInetFD_ISSET(i, writefds)) {
+			const NpRelay::Status status = NpRelay::SocketStatus(i);
+			relayHideWrite[i] = status == NpRelay::Status::Opening;
+			if (status == NpRelay::Status::Refused || status == NpRelay::Status::Reset) {
+				relayWrite[i] = true;
+				relayReady++;
+			}
+		}
+	}
+
 	for (int i = SocketManager::MIN_VALID_INET_SOCKET; i < nfds; i++) {
 		if (readfds && (NetInetFD_ISSET(i, readfds))) {
 			SOCKET sock = g_socketManager.GetHostSocketFromInetSocket(i);
@@ -419,7 +494,7 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 				ERROR_LOG(Log::sceNet, "Hit set size (rd)");
 			}
 		}
-		if (writefds && (NetInetFD_ISSET(i, writefds))) {
+		if (writefds && (NetInetFD_ISSET(i, writefds)) && !relayHideWrite[i]) {
 			SOCKET sock = g_socketManager.GetHostSocketFromInetSocket(i);
 			_dbg_assert_(sock != 0);
 			if (sock < 0) {
@@ -467,10 +542,13 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 		tmout.tv_sec = timeout->tv_sec;
 		tmout.tv_usec = timeout->tv_usec;
 	}
+	if (relayReady > 0)
+		tmout = { 0, 0 };
 	DEBUG_LOG(Log::sceNet, "Select(host: %d): Read count: %d, Write count: %d, Except count: %d, TimeVal: %u.%u", maxHostSocket + 1, rdcnt, wrcnt, excnt, (int)tmout.tv_sec, (int)tmout.tv_usec);
 	// TODO: Simulate blocking behaviour when timeout = NULL to prevent PPSSPP from freezing
 	// Note: select can overwrite tmout.
-	int retval = select(maxHostSocket + 1, readfds ? &rdfds : nullptr, writefds ? &wrfds : nullptr, exceptfds ? &exfds : nullptr, /*(timeout == NULL) ? NULL :*/ &tmout);
+	// With no host socket left (only relayed ones), there's nothing to wait for; Windows would fail the select.
+	int retval = rdcnt + wrcnt + excnt == 0 ? 0 : select(maxHostSocket + 1, readfds ? &rdfds : nullptr, writefds ? &wrfds : nullptr, exceptfds ? &exfds : nullptr, /*(timeout == NULL) ? NULL :*/ &tmout);
 	if (g_Config.bNpP2PTrace) {
 		p2pTrace.selects++;
 		if (retval > 0)
@@ -506,6 +584,19 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 			}
 		}
 	}
+	if (relayReady > 0) {
+		retval = std::max(retval, 0);
+		for (int i = SocketManager::MIN_VALID_INET_SOCKET; i < nfds; i++) {
+			if (relayRead[i] && !NetInetFD_ISSET(i, readfds)) {
+				NetInetFD_SET(i, readfds);
+				retval++;
+			}
+			if (relayWrite[i] && !NetInetFD_ISSET(i, writefds)) {
+				NetInetFD_SET(i, writefds);
+				retval++;
+			}
+		}
+	}
 
 	if (retval < 0) {
 		UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__);
@@ -525,6 +616,10 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 
 	fd_set readfds{}, writefds{}, exceptfds{};
 	FD_ZERO(&readfds); FD_ZERO(&writefds); FD_ZERO(&exceptfds);
+	// Relayed sockets, as in select.
+	std::vector<NpRelay::Status> relayStatus(nfds);
+	std::vector<bool> relayRead(nfds);
+	bool relayReady = false;
 	for (int i = 0; i < (s32)nfds; i++) {
 		if (fdarray[i].fd < 0) {
 			// In Unix, this is OK and means it the fd should be ignored, except fdarray[i].revents should be zeroed.
@@ -540,6 +635,9 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 		FD_SET(hostSocket, &writefds);
 		FD_SET(hostSocket, &exceptfds);
 		fdarray[i].revents = 0;
+		relayStatus[i] = NpRelay::SocketStatus(fdarray[i].fd);
+		relayRead[i] = NpRelay::Readable(fdarray[i].fd);
+		relayReady = relayReady || relayRead[i] || relayStatus[i] == NpRelay::Status::Refused || relayStatus[i] == NpRelay::Status::Reset;
 	}
 
 	timeval tmout = { 5, 543210 }; // Workaround timeout value when timeout = NULL
@@ -547,6 +645,8 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 		tmout.tv_sec = timeout / 1000000; // seconds
 		tmout.tv_usec = (timeout % 1000000); // microseconds
 	}
+	if (relayReady)
+		tmout = { 0, 0 };
 	// TODO: Simulate blocking behaviour when timeout is non-zero to prevent PPSSPP from freezing
 	retval = select(maxHostFd + 1, &readfds, &writefds, &exceptfds, /*(timeout<0)? NULL:*/&tmout);
 	if (g_Config.bNpP2PTrace) {
@@ -563,8 +663,12 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeout) { // timeout in milisecond
 		SOCKET hostSocket = g_socketManager.GetHostSocketFromInetSocket(fdarray[i].fd);
 		if ((fdarray[i].events & (INET_POLLRDNORM | INET_POLLIN)) && FD_ISSET(hostSocket, &readfds) && !LoopbackHidesRead(fdarray[i].fd))
 			fdarray[i].revents |= (INET_POLLRDNORM | INET_POLLIN); //POLLIN_SET
-		if ((fdarray[i].events & (INET_POLLWRNORM | INET_POLLOUT)) && FD_ISSET(hostSocket, &writefds))
+		if ((fdarray[i].events & (INET_POLLWRNORM | INET_POLLOUT)) && FD_ISSET(hostSocket, &writefds) && relayStatus[i] != NpRelay::Status::Opening)
 			fdarray[i].revents |= (INET_POLLWRNORM | INET_POLLOUT); //POLLOUT_SET
+		if (relayRead[i])
+			fdarray[i].revents |= (INET_POLLRDNORM | INET_POLLIN);
+		if (relayStatus[i] == NpRelay::Status::Refused || relayStatus[i] == NpRelay::Status::Reset)
+			fdarray[i].revents |= (INET_POLLRDNORM | INET_POLLIN | INET_POLLWRNORM | INET_POLLOUT);
 		fdarray[i].revents &= fdarray[i].events;
 		if (FD_ISSET(hostSocket, &exceptfds))
 			fdarray[i].revents |= (INET_POLLRDBAND | INET_POLLPRI | INET_POLLERR); //POLLEX_SET; // Can be raised on revents regardless of events bitmask?
@@ -581,6 +685,16 @@ static int sceNetInetRecv(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
 		return hleLogError(Log::sceNet, ERROR_INET_EBADF, "Bad socket #%d", socket);
 	}
+
+	if (const int relayError = RelayFailure(socket)) {
+		UpdateErrnoFromHost(__KernelGetCurThread(), relayError, __FUNCTION__);
+		return hleDelayResult(hleLogError(Log::sceNet, -1, "relayed connection failed"), "workaround until blocking-socket", 500);
+	}
+	u32 relaySrc;
+	u16 relaySrcPort;
+	const int relayed = NpRelay::RecvDatagram(socket, Memory::GetPointerWrite(bufPtr), Memory::IsValidRange(bufPtr, bufLen) ? (int)bufLen : 0, &relaySrc, &relaySrcPort);
+	if (relayed >= 0)
+		return hleDelayResult(hleLogInfo(Log::sceNet, relayed, "relayed datagram"), "workaround until blocking-socket", 500);
 
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
@@ -622,6 +736,20 @@ static int sceNetInetSend(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 	std::string datahex;
 	DataToHexString(10, 0, Memory::GetPointer(bufPtr), bufLen, &datahex);
 	VERBOSE_LOG(Log::sceNet, "Data Dump (%d bytes):\n%s", bufLen, datahex.c_str());
+
+	if (const int relayError = RelayFailure(socket)) {
+		UpdateErrnoFromHost(__KernelGetCurThread(), relayError, __FUNCTION__);
+		return hleLogError(Log::sceNet, -1, "relayed connection failed");
+	}
+	u32 relayDst;
+	u16 relayDstPort;
+	if (NpRelay::GetDefaultDest(socket, &relayDst, &relayDstPort)) {
+		if (!NpRelay::SendDatagram(relayDst, relayDstPort, GameLocalPort(socket, inetSock), Memory::GetPointer(bufPtr), bufLen)) {
+			UpdateErrnoFromHost(__KernelGetCurThread(), ENETUNREACH, __FUNCTION__);
+			return hleLogError(Log::sceNet, -1, "relay unavailable");
+		}
+		return hleLogDebug(Log::sceNet, bufLen, "relayed datagram");
+	}
 
 	int flgs = flags & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
@@ -752,6 +880,13 @@ static int sceNetInetGetsockopt(int socket, int level, int optname, u32 optvalPt
 	u32_le* optval = (u32_le*)Memory::GetPointer(optvalPtr);
 	socklen_t* optlen = (socklen_t*)Memory::GetPointer(optlenPtr);
 	DEBUG_LOG(Log::sceNet, "SockOpt: Level = %s, OptName = %s", inetSockoptLevel2str(level).c_str(), inetSockoptName2str(optname, level).c_str());
+	if (level == PSP_NET_INET_SOL_SOCKET && optname == PSP_NET_INET_SO_ERROR && optval && optlen) {
+		if (const int relayError = RelayFailure(socket)) {
+			*optval = convertInetErrnoHost2PSP(relayError);
+			*optlen = sizeof(u32);
+			return hleLogInfo(Log::sceNet, 0, "relayed connection failed: %s", convertInetErrno2str(*optval));
+		}
+	}
 	timeval tval{};
 	// TODO: Ignoring SO_NBIO/SO_NONBLOCK flag if we always use non-bloking mode (ie. simulated blocking mode)
 	if (level == PSP_NET_INET_SOL_SOCKET && optname == PSP_NET_INET_SO_NBIO) {
@@ -891,6 +1026,8 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 			ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
 	}
 	changeBlockingMode(inetSock->sock, 1);
+	if (IsHostDgram(inetSock->sock))
+		NpRelay::BindUdp(socket, ntohs(saddr.in.sin_port));
 	// Update binded port number if it was 0 (any port)
 	memcpy(name->sa_data, saddr.addr.sa_data, sizeof(name->sa_data));
 	// Enable Port-forwarding
@@ -907,6 +1044,36 @@ static int sceNetInetBind(int socket, u32 namePtr, int namelen) {
 	return hleLogInfo(Log::sceNet, retval);
 }
 
+// connect() to a peer behind the relay. TCP: the game's host socket is swapped for a loopback one that the relay
+// serves. UDP: remembers the peer for send().
+static int RelayConnect(int socket, InetSocket *inetSock, const SockAddrIN4 &saddr) {
+	const u32 dst = saddr.in.sin_addr.s_addr;
+	const u16 dstPort = ntohs(saddr.in.sin_port);
+	const std::string dstStr = ip2str(saddr.in.sin_addr);
+	if (IsHostDgram(inetSock->sock)) {
+		NpRelay::SetDefaultDest(socket, dst, dstPort);
+		return hleLogInfo(Log::sceNet, 0, "UDP peer %s:%d (relay)", dstStr.c_str(), dstPort);
+	}
+	int hostErrno = 0;
+	switch (NpRelay::SocketStatus(socket)) {
+	case NpRelay::Status::Opening: hostErrno = EALREADY; break;
+	case NpRelay::Status::Open: hostErrno = EISCONN; break;
+	case NpRelay::Status::Refused: hostErrno = ECONNREFUSED; break;
+	case NpRelay::Status::Reset: hostErrno = ECONNRESET; break;
+	default:
+		hostErrno = NpRelay::Connect(socket, &inetSock->sock, !inetSock->nonblocking, dst, dstPort, GameLocalPort(socket, inetSock));
+		if (hostErrno == 0 && !inetSock->nonblocking)
+			return hleLogInfo(Log::sceNet, 0, "Connect: %s:%d through the relay", dstStr.c_str(), dstPort);
+		if (hostErrno == 0)
+			hostErrno = EINPROGRESS;
+		break;
+	}
+	const int pspErrno = UpdateErrnoFromHost(__KernelGetCurThread(), hostErrno, __FUNCTION__);
+	if (hostErrno == EINPROGRESS || hostErrno == EALREADY)
+		return hleLogInfo(Log::sceNet, -1, "errno = %s Address = %s, Port = %d (relay)", convertInetErrno2str(pspErrno), dstStr.c_str(), dstPort);
+	return hleLogError(Log::sceNet, -1, "errno = %s Address = %s, Port = %d (relay)", convertInetErrno2str(pspErrno), dstStr.c_str(), dstPort);
+}
+
 static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	InetSocket *inetSock;
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
@@ -920,6 +1087,12 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	int dstlen = std::min(sockAddrLen > 0 ? sockAddrLen : 0, static_cast<int>(sizeof(saddr)));
 	saddr.addr.sa_family = dst->sa_family;
 	memcpy(saddr.addr.sa_data, dst->sa_data, sizeof(dst->sa_data));
+
+	if (saddr.addr.sa_family == AF_INET && NpRelay::IsRelayAddr(saddr.in.sin_addr.s_addr)) {
+		if (!NpRelay::IsOwnAddr(saddr.in.sin_addr.s_addr))
+			return RelayConnect(socket, inetSock, saddr);
+		saddr.in.sin_addr.s_addr = INADDR_ANY;  // our own virtual address: this host, as below
+	}
 
 	// On the PSP's BSD stack, connecting to INADDR_ANY (0.0.0.0) reaches this host. Windows refuses it, so use
 	// loopback. PSP2i's lobby does this: it connects to its own room member entry, which has address 0.
@@ -988,6 +1161,7 @@ static int sceNetInetListen(int socket, int backlog) {
 		UpdateErrnoFromHost(__KernelGetCurThread(), socket_errno, __FUNCTION__);
 		return hleLogError(Log::sceNet, retval);
 	}
+	NpRelay::Listen(socket, (u16)inetSock->port);
 
 	return hleLogInfo(Log::sceNet, retval);
 }
@@ -996,6 +1170,23 @@ static int sceNetInetAccept(int socket, u32 addrPtr, u32 addrLenPtr) {
 	InetSocket *inetSock;
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
 		return hleLogError(Log::sceNet, ERROR_INET_EBADF, "Bad socket #%d", socket);
+	}
+
+	// A peer that connected through the relay.
+	SOCKET relayedSocket;
+	u32 relayPeer, relayToken;
+	u16 relayPeerPort;
+	if (NpRelay::Accept(socket, &relayedSocket, &relayPeer, &relayPeerPort, &relayToken)) {
+		int newSocketId;
+		if (!g_socketManager.AdoptSocket(&newSocketId, relayedSocket, inetSock)) {
+			closesocket(relayedSocket);
+			UpdateErrnoFromHost(__KernelGetCurThread(), ENOMEM, __FUNCTION__);
+			return hleLogError(Log::sceNet, -1, "Out of socket IDs");
+		}
+		NpRelay::Accepted(newSocketId, relayToken);
+		if (addrPtr)
+			WritePspSockaddr(addrPtr, addrLenPtr, relayPeer, relayPeerPort);
+		return hleLogInfo(Log::sceNet, newSocketId, "relayed connection from %s:%d", ip2str(*(in_addr *)&relayPeer).c_str(), relayPeerPort);
 	}
 
 	SceNetInetSockaddr* src = (SceNetInetSockaddr*)Memory::GetCharPointer(addrPtr);
@@ -1066,6 +1257,7 @@ static int sceNetInetClose(int socket) {
 		return hleLogError(Log::sceNet, ERROR_INET_EBADF, "Bad socket #%d", socket);
 	}
 
+	NpRelay::SocketClosed(socket);
 	g_socketManager.Close(inetSock);
 	p2pBoundVport.erase(socket);
 	return hleLogInfo(Log::sceNet, 0);
@@ -1083,6 +1275,7 @@ static int sceNetInetCloseWithRST(int socket) {
 	sl.l_onoff = 1;		// non-zero value enables linger option in kernel
 	sl.l_linger = 0;	// timeout interval in seconds
 	setsockopt(inetSock->sock, SOL_SOCKET, SO_LINGER, (const char*)&sl, sizeof(sl));
+	NpRelay::SocketClosed(socket);
 	g_socketManager.Close(inetSock);
 	p2pBoundVport.erase(socket);
 	return hleLogInfo(Log::sceNet, 0);
@@ -1105,6 +1298,29 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 	InetSocket *inetSock;
 	if (!g_socketManager.GetInetSocket(socket, &inetSock)) {
 		return hleLogError(Log::sceNet, ERROR_INET_EBADF, "Bad socket #%d", socket);
+	}
+
+	// Datagrams from relayed peers come first.
+	u32 relaySrc;
+	u16 relaySrcPort;
+	const int relayed = NpRelay::RecvDatagram(socket, Memory::GetPointerWrite(bufferPtr), Memory::IsValidRange(bufferPtr, len) ? len : 0, &relaySrc, &relaySrcPort);
+	if (relayed >= 0) {
+		if (fromPtr)
+			WritePspSockaddr(fromPtr, fromlenPtr, relaySrc, relaySrcPort);
+		SockAddrIN4 from{};
+		from.in.sin_family = AF_INET;
+		from.in.sin_port = htons(relaySrcPort);
+		from.in.sin_addr.s_addr = relaySrc;
+		if (g_Config.bNpP2PTrace && IsP2PSocket(inetSock)) {
+			p2pTrace.p2pRecvOk++;
+			P2PTraceDatagram("recv (relay)", socket, from, -1, bufferPtr, relayed);
+			P2PTraceTick();
+		} else if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pRecvCount)) {
+			INFO_LOG(Log::sceNet, "P2P recvfrom #%d: socket %d, %d bytes from %s:%d (relay)", p2pRecvCount, socket, relayed,
+				ip2str(from.in.sin_addr).c_str(), relaySrcPort);
+		}
+		return hleDelayResult(hleLogDebug(Log::sceNet, relayed, "RecvFrom: Address = %s, Port = %d (relay)", ip2str(from.in.sin_addr).c_str(), relaySrcPort),
+			"workaround until blocking-socket", 500);
 	}
 
 	SceNetInetSockaddr* src = (SceNetInetSockaddr*)Memory::GetCharPointer(fromPtr);
@@ -1192,6 +1408,22 @@ static int sceNetInetSendto(int socket, u32 bufferPtr, int len, int flags, u32 t
 	std::string datahex;
 	DataToHexString(0, 0, Memory::GetPointer(bufferPtr), len, &datahex);
 	VERBOSE_LOG(Log::sceNet, "Data Dump (%d bytes):\n%s", len, datahex.c_str());
+
+	if (dst && saddr.addr.sa_family == AF_INET && NpRelay::IsRelayAddr(saddr.in.sin_addr.s_addr)) {
+		const bool ok = len >= 0 && NpRelay::SendDatagram(saddr.in.sin_addr.s_addr, ntohs(saddr.in.sin_port), GameLocalPort(socket, inetSock), Memory::GetPointer(bufferPtr), len);
+		if (IsP2PSocket(inetSock) && g_Config.bNpP2PTrace) {
+			p2pTrace.p2pSends++;
+			P2PTraceDatagram(ok ? "send (relay)" : "send (relay) FAILED", socket, saddr, ntohs(*(u16 *)&saddr.addr.sa_data[6]), bufferPtr, len);
+			P2PTraceTick();
+		} else if (IsP2PSocket(inetSock) && ShouldLogP2P(&p2pSendCount)) {
+			INFO_LOG(Log::sceNet, "P2P sendto #%d: socket %d, %d bytes to %s:%d (relay)", p2pSendCount, socket, len, ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
+		}
+		if (!ok) {
+			UpdateErrnoFromHost(__KernelGetCurThread(), ENETUNREACH, __FUNCTION__);
+			return hleLogError(Log::sceNet, -1, "relay unavailable");
+		}
+		return hleLogDebug(Log::sceNet, len, "SendTo: Address = %s, Port = %d (relay)", ip2str(saddr.in.sin_addr).c_str(), ntohs(saddr.in.sin_port));
+	}
 
 	int retval;
 	bool isBcast = isBroadcastIP(saddr.in.sin_addr.s_addr);
