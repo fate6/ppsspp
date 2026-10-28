@@ -31,6 +31,7 @@
 #include "Common/File/FileDescriptor.h"
 #include "Common/Log.h"
 #include "Common/Thread/ThreadUtil.h"
+#include "Common/Net/SocketCompat.h"
 #include "Core/HLE/NetInetConstants.h"
 #include "Core/HLE/NpRelay.h"
 
