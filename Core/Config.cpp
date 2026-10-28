@@ -1080,6 +1080,7 @@ static const ConfigSetting networkSettings[] = {
 	ConfigSetting("NpLoopbackHost", SETTING(g_Config, sNpLoopbackHost), "", CfgFlag::PER_GAME),
 	ConfigSetting("NpP2PTrace", SETTING(g_Config, bNpP2PTrace), false, CfgFlag::PER_GAME),
 	ConfigSetting("NpRelay", SETTING(g_Config, bNpRelay), true, CfgFlag::PER_GAME),
+	ConfigSetting("HostsOverride", SETTING(g_Config, bHostsOverride), false, CfgFlag::PER_GAME),
 	ConfigSetting("LoopbackLatencyVblanks", SETTING(g_Config, iLoopbackLatencyVblanks), 6, CfgFlag::PER_GAME),
 	ConfigSetting("InfrastructureAutoDNS", SETTING(g_Config, bInfrastructureAutoDNS), true, CfgFlag::PER_GAME),
 	ConfigSetting("AllowSavestateWhileConnected", SETTING(g_Config, bAllowSavestateWhileConnected), false, CfgFlag::DONT_SAVE),
@@ -1332,6 +1333,31 @@ std::string Config::GetConfigAsString() {
 	return "";
 }
 
+// psp2i fork: [HostsOverride], kept in file order. Lives in the game's ini when there is one, like the post shader settings.
+static void LoadHostsOverride(IniFile &iniFile, std::vector<std::pair<std::string, std::string>> *entries) {
+	entries->clear();
+	const Section *section = iniFile.GetSection("HostsOverride");
+	if (!section)
+		return;
+	for (const ParsedIniLine &line : section->Lines()) {
+		if (!line.Key().empty())
+			entries->emplace_back(std::string(line.Key()), std::string(line.Value()));
+	}
+}
+
+static void SaveHostsOverride(IniFile &iniFile, const std::vector<std::pair<std::string, std::string>> &entries) {
+	if (entries.empty()) {
+		iniFile.DeleteSection("HostsOverride");
+		return;
+	}
+	Section *section = iniFile.GetOrCreateSection("HostsOverride");
+	section->Clear();
+	for (const auto &[name, target] : entries) {
+		if (!name.empty())
+			section->Set(name, target);
+	}
+}
+
 void Config::Load(const char *iniFileName, const char *controllerIniFilename) {
 	double startTime = time_now_d();
 
@@ -1434,6 +1460,7 @@ void Config::Load(const char *iniFileName, const char *controllerIniFilename) {
 	const Section *hostOverrideSetting = iniFile.GetOrCreateSection("HostAliases");
 	// TODO: relocate me before PR
 	mHostToAlias = hostOverrideSetting->ToMap();
+	LoadHostsOverride(iniFile, &vHostsOverride);
 
 	// Load post process shader names
 	vPostShaderNames.clear();
@@ -1544,6 +1571,7 @@ bool Config::Save(const char *saveReason) {
 				snprintf(keyName, sizeof(keyName), "PostShader%d", (int)i+1);
 				postShaderChain->Set(keyName, vPostShaderNames[i]);
 			}
+			SaveHostsOverride(iniFile, vHostsOverride);
 		}
 
 		// TODO: relocate me before PR
@@ -1905,6 +1933,8 @@ bool Config::SaveGameConfig(const std::string &gameId, std::string_view titleFor
 		postShaderChain->Set(keyName, vPostShaderNames[i]);
 	}
 
+	SaveHostsOverride(iniFile, vHostsOverride);
+
 	KeyMap::SaveToIni(iniFile);
 	iniFile.Save(fullIniFilePath);
 
@@ -1949,6 +1979,8 @@ bool Config::LoadGameConfig(const std::string &gameId) {
 		if (v != "Off")
 			vPostShaderNames.push_back(v);
 	}
+
+	LoadHostsOverride(iniFile, &vHostsOverride);
 
 	for (const ConfigSectionMeta &meta : g_sectionMeta) {
 		Section *section = iniFile.GetSection(meta.section);
@@ -2004,6 +2036,8 @@ void Config::UnloadGameConfig() {
 		if (v != "Off")
 			vPostShaderNames.push_back(v);
 	}
+
+	LoadHostsOverride(iniFile, &vHostsOverride);
 
 	LoadStandardControllerIni();
 	PostLoadCleanup();

@@ -41,6 +41,7 @@
 #include "Core/System.h"
 #include "Core/HLE/NpMatching2Backend.h"
 #include "Core/HLE/NpRelay.h"
+#include "Core/HLE/sceNet.h"
 #include "Core/HLE/sceNp.h"
 #include "Core/HLE/sceNp2.h"
 #include "Core/HLE/sceRtc.h"
@@ -969,7 +970,12 @@ NpMatching2Backend *g_backend = &g_fakeBackend;
 }  // namespace
 
 void NpMatching2SelectBackend() {
-	const std::string &server = g_Config.sNpMatching2Server;
+	std::string server = g_Config.sNpMatching2Server;
+	// No server set: a hosts override for "np-matching2" (a "*" line covers it) points at the matching server too,
+	// on its default port. So a player only needs "* = <server>".
+	std::string target;
+	if (server.empty() && LookupHostsOverride("np-matching2", &target))
+		server = target + ":12021";
 	if (server.empty()) {
 		g_networkBackend.reset();
 		g_backend = &g_fakeBackend;

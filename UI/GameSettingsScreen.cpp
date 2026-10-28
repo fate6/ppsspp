@@ -1101,6 +1101,18 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	networkingSettings->Add(new CheckBox(&g_Config.bInfrastructureAutoDNS, n->T("Autoconfigure")));
 	auto *dnsServer = networkingSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sInfrastructureDNSServer, n->T("DNS server"), "", 32, screenManager()));
 	dnsServer->SetDisabledPtr(&g_Config.bInfrastructureAutoDNS);
+	// psp2i fork: a hosts file per game, so no DNS server (UDP 53) is needed. The list lives in the game's config.
+	networkingSettings->Add(new CheckBox(&g_Config.bHostsOverride, n->T("Use hosts overrides")));
+	if (g_Config.IsGameSpecific()) {
+		Choice *hosts = networkingSettings->Add(new Choice(n->T("Hosts overrides..."), ApplySafeSubstitutions(n->T("%1 entries"), (int)g_Config.vHostsOverride.size())));
+		hosts->SetEnabledPtr(&g_Config.bHostsOverride);
+		hosts->OnClick.Add([this](UI::EventParams &e) {
+			screenManager()->push(new HostsOverrideScreen(gamePath_));
+		});
+		networkingSettings->Add(new SettingHint(n->T("HostsOverrideHint", "Hostnames the game looks up go to these addresses first. Example: * = your server."), hosts));
+	} else {
+		networkingSettings->Add(new SettingHint(n->T("HostsOverrideGameHint", "The overrides themselves are set per game, in a game's own settings."), nullptr));
+	}
 
 	networkingSettings->Add(new ItemHeader(n->T("UPnP (port-forwarding)")));
 	networkingSettings->Add(new CheckBox(&g_Config.bEnableUPnP, n->T("Enable UPnP", "Enable UPnP (need a few seconds to detect)")));
@@ -1918,4 +1930,57 @@ void RestoreSettingsScreen::OnCompleted(DialogResult result) {
 	if (result == DialogResult::DR_OK) {
 		g_Config.RestoreDefaults((RestoreSettingsBits)restoreFlags_);
 	}
+}
+
+// psp2i fork: hosts overrides.
+
+HostsOverrideScreen::HostsOverrideScreen(const Path &gamePath) : UISimpleBaseDialogScreen(gamePath, SimpleDialogFlags::ContentsCanScroll) {
+	for (const auto &[name, target] : g_Config.vHostsOverride)
+		entries_.push_back(std::make_unique<Entry>(Entry{ name, target }));
+}
+
+HostsOverrideScreen::~HostsOverrideScreen() {
+	Store();
+}
+
+std::string_view HostsOverrideScreen::GetTitle() const {
+	auto n = GetI18NCategory(I18NCat::NETWORKING);
+	return n->T("Hosts overrides");
+}
+
+// Saved with the settings, when the settings screen closes. Rows without a name aren't kept.
+void HostsOverrideScreen::Store() {
+	g_Config.vHostsOverride.clear();
+	for (const auto &entry : entries_) {
+		const std::string name(StripSpaces(entry->name));
+		if (!name.empty())
+			g_Config.vHostsOverride.emplace_back(name, std::string(StripSpaces(entry->target)));
+	}
+}
+
+void HostsOverrideScreen::CreateDialogViews(UI::ViewGroup *parent) {
+	using namespace UI;
+	auto n = GetI18NCategory(I18NCat::NETWORKING);
+
+	LinearLayout *list = parent->Add(new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT)));
+	list->SetSpacing(0);
+	list->Add(new SettingHint(n->T("HostsOverrideRules", "Name: a hostname, *.domain, or * for everything. Target: an IP, or a hostname looked up through your normal DNS. The exact name wins, then the longest *.domain, then *."), nullptr));
+	for (size_t i = 0; i < entries_.size(); i++) {
+		Entry *entry = entries_[i].get();
+		LinearLayout *row = list->Add(new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT)));
+		PopupTextInputChoice *name = row->Add(new PopupTextInputChoice(GetRequesterToken(), &entry->name, n->T("Host name"), "*", 128, screenManager(), new LinearLayoutParams(1.0f)));
+		name->OnChange.Add([this](EventParams &e) { Store(); });
+		PopupTextInputChoice *target = row->Add(new PopupTextInputChoice(GetRequesterToken(), &entry->target, n->T("Target"), "", 128, screenManager(), new LinearLayoutParams(1.0f)));
+		target->OnChange.Add([this](EventParams &e) { Store(); });
+		row->Add(new Choice(ImageID("I_TRASHCAN"), new LinearLayoutParams(WRAP_CONTENT, FILL_PARENT)))->OnClick.Add([this, i](EventParams &e) {
+			removed_.push_back(std::move(entries_[i]));
+			entries_.erase(entries_.begin() + i);
+			Store();
+			RecreateViews();
+		});
+	}
+	list->Add(new Choice(n->T("Add override"), ImageID("I_PLUS")))->OnClick.Add([this](EventParams &e) {
+		entries_.push_back(std::make_unique<Entry>());
+		RecreateViews();
+	});
 }

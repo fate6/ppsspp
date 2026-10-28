@@ -128,6 +128,8 @@ bool PollInfraJsonDownload(std::string *jsonOutput);
 bool LoadAutoDNS(std::string_view json);
 void DeleteAutoDNSCacheFile();
 std::string ProcessHostnameWithInfraDNS(const std::string &hostname);
+// psp2i fork: the [HostsOverride] target for hostname, if the switch is on and an entry matches.
+bool LookupHostsOverride(const std::string &hostname, std::string *target);
 
 // These return false if allowed to be consistent with the similar function for achievements.
 bool NetworkWarnUserIfOnlineAndCantSavestate();

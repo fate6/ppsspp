@@ -464,7 +464,47 @@ bool PollInfraJsonDownload(std::string *jsonOutput) {
 	return true;
 }
 
+// psp2i fork: [Network] HostsOverride, a hosts file per game (Config::vHostsOverride). The exact name wins, then the
+// longest matching "*.domain", then "*". Names compare without case.
+bool LookupHostsOverride(const std::string &hostname, std::string *target) {
+	if (!g_Config.bHostsOverride || hostname.empty())
+		return false;
+	const std::string host(StripSpaces(hostname));
+	const auto &entries = g_Config.vHostsOverride;
+	const std::pair<std::string, std::string> *best = nullptr;
+	size_t bestLen = 0;
+	for (const auto &entry : entries) {
+		const std::string &name = entry.first;
+		if (equalsNoCase(name, host)) {
+			best = &entry;
+			break;
+		}
+		size_t len = 0;
+		if (name == "*") {
+			len = 1;
+		} else if (name.size() > 2 && name[0] == '*' && name[1] == '.' && host.size() > name.size() - 1 &&
+			equalsNoCase(host.substr(host.size() - (name.size() - 1)), name.substr(1))) {
+			len = name.size();  // "*.domain" covers anything under domain, not domain itself
+		}
+		if (len > bestLen) {
+			best = &entry;
+			bestLen = len;
+		}
+	}
+	if (!best || StripSpaces(best->second).empty())
+		return false;
+	*target = StripSpaces(best->second);
+	INFO_LOG(Log::sceNet, "Hosts override: %s -> %s (rule '%s')", host.c_str(), target->c_str(), best->first.c_str());
+	return true;
+}
+
 std::string ProcessHostnameWithInfraDNS(const std::string &hostname) {
+	// psp2i fork: hosts overrides come first, with or without InfrastructureAutoDNS. A hostname target goes to the OS
+	// resolver (the caller's), not to the PSP DNS server: dynamic DNS and the like work, and no port 53 is needed.
+	std::string overrideTarget;
+	if (LookupHostsOverride(hostname, &overrideTarget))
+		return overrideTarget;
+
 	std::string resolvedHostname = hostname;
 	
 	// Resolve any aliases. First check the ini file, then check the hardcoded DNS config.

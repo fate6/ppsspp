@@ -26,6 +26,7 @@
 #include "Common/UI/PopupScreens.h"
 #include "Core/ConfigValues.h"
 #include "UI/BaseScreens.h"
+#include "UI/SimpleDialogScreen.h"
 #include "UI/TabbedDialogScreen.h"
 #include "Core/Config.h"
 
@@ -124,6 +125,26 @@ public:
 private:
 	void OnCompleted(DialogResult result) override;
 	int restoreFlags_ = (int)(RestoreSettingsBits::SETTINGS);  // RestoreSettingsBits enum
+};
+
+// psp2i fork: edits [HostsOverride] (Config::vHostsOverride): one row per entry, + adds one.
+class HostsOverrideScreen : public UISimpleBaseDialogScreen {
+public:
+	HostsOverrideScreen(const Path &gamePath);
+	~HostsOverrideScreen();
+	void CreateDialogViews(UI::ViewGroup *parent) override;
+	std::string_view GetTitle() const override;
+	const char *tag() const override { return "HostsOverride"; }
+
+private:
+	struct Entry {
+		std::string name;
+		std::string target;
+	};
+	void Store();
+
+	std::vector<std::unique_ptr<Entry>> entries_;
+	std::vector<std::unique_ptr<Entry>> removed_;  // their views live until the next layout
 };
 
 void TriggerRestart(const char *why, bool editThenRestore, const Path &gamePath);
