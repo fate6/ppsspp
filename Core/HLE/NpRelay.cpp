@@ -104,6 +104,10 @@ std::map<int, std::deque<QueuedAccept>> &g_acceptQueue = *new std::map<int, std:
 std::map<u16, int> &g_udpReceivers = *new std::map<u16, int>();  // port -> the UDP game socket that receives on it
 std::map<int, std::deque<Datagram>> &g_datagrams = *new std::map<int, std::deque<Datagram>>();
 std::map<int, std::pair<u32, u16>> &g_defaultDest = *new std::map<int, std::pair<u32, u16>>();  // connected UDP game sockets
+// TCP connections to our own vaddr run over host loopback (so the loopback latency of sceNetInet applies). Both ends
+// still show the vaddr as the peer: game socket -> (our vaddr, peer port); connecting socket's local port -> it.
+std::map<int, std::pair<u32, u16>> &g_selfPeer = *new std::map<int, std::pair<u32, u16>>();
+std::map<u16, int> &g_selfPorts = *new std::map<u16, int>();
 int g_dropLogCount = 0;
 
 std::mutex &g_startStopMutex = *new std::mutex();
@@ -427,16 +431,8 @@ void OnData(const std::string &body) {
 	WriteToEnd(*s, body.data() + 4, body.size() - 4);
 }
 
-void OnDatagram(const std::string &body) {
-	if (body.size() < 8)
-		return;
-	Datagram d;
-	u16 dstPort;
-	memcpy(&d.src, body.data(), 4);
-	memcpy(&dstPort, body.data() + 4, 2);
-	memcpy(&d.srcPort, body.data() + 6, 2);
-	d.data = body.substr(8);
-	std::lock_guard<std::mutex> guard(g_mutex);
+// For the UDP socket bound to dstPort, if there is one.
+void QueueDatagramLocked(u16 dstPort, Datagram &&d) {
 	auto it = g_udpReceivers.find(dstPort);
 	if (it == g_udpReceivers.end()) {
 		if (g_dropLogCount++ < 20)
@@ -447,6 +443,19 @@ void OnDatagram(const std::string &body) {
 	if (queue.size() >= MAX_QUEUED_DATAGRAMS)
 		queue.pop_front();
 	queue.push_back(std::move(d));
+}
+
+void OnDatagram(const std::string &body) {
+	if (body.size() < 8)
+		return;
+	Datagram d;
+	u16 dstPort;
+	memcpy(&d.src, body.data(), 4);
+	memcpy(&dstPort, body.data() + 4, 2);
+	memcpy(&d.srcPort, body.data() + 6, 2);
+	d.data = body.substr(8);
+	std::lock_guard<std::mutex> guard(g_mutex);
+	QueueDatagramLocked(dstPort, std::move(d));
 }
 
 // Drops every game socket's relay state. Queued connections are closed, which ends their streams.
@@ -462,6 +471,8 @@ void ResetSocketsLocked() {
 	g_udpReceivers.clear();
 	g_datagrams.clear();
 	g_defaultDest.clear();
+	g_selfPeer.clear();
+	g_selfPorts.clear();
 }
 
 void StopLocked() {
@@ -686,13 +697,33 @@ bool GetPeer(int socket, u32 *addr, u16 *port) {
 		*port = it->second->peerPort;
 		return true;
 	}
-	auto d = g_defaultDest.find(socket);
-	if (d != g_defaultDest.end()) {
-		*addr = d->second.first;
-		*port = d->second.second;
-		return true;
+	for (const auto *peers : { &g_defaultDest, &g_selfPeer }) {
+		auto d = peers->find(socket);
+		if (d != peers->end()) {
+			*addr = d->second.first;
+			*port = d->second.second;
+			return true;
+		}
 	}
 	return false;
+}
+
+void NoteSelfConnect(int socket, u16 localPort, u16 dstPort) {
+	std::lock_guard<std::mutex> guard(g_mutex);
+	if (!g_active)
+		return;
+	g_selfPeer[socket] = { g_vaddr, dstPort };
+	if (localPort)
+		g_selfPorts[localPort] = socket;
+}
+
+bool AcceptedFromSelf(int socket, u16 peerPort, u32 *vaddr) {
+	std::lock_guard<std::mutex> guard(g_mutex);
+	if (!g_active || !g_selfPorts.count(peerPort))
+		return false;
+	g_selfPeer[socket] = { g_vaddr, peerPort };
+	*vaddr = g_vaddr;
+	return true;
 }
 
 void Listen(int socket, u16 port) {
@@ -734,6 +765,14 @@ void BindUdp(int socket, u16 port) {
 }
 
 bool SendDatagram(u32 dst, u16 dstPort, u16 srcPort, const u8 *data, size_t size) {
+	{
+		// To ourselves: the server wouldn't pass it back, so deliver it here, from our vaddr.
+		std::lock_guard<std::mutex> guard(g_mutex);
+		if (g_active && dst == g_vaddr) {
+			QueueDatagramLocked(dstPort, Datagram{ g_vaddr, srcPort, std::string((const char *)data, size) });
+			return true;
+		}
+	}
 	std::string body(8, '\0');
 	memcpy(&body[0], &dst, 4);
 	memcpy(&body[4], &dstPort, 2);
@@ -770,7 +809,11 @@ void SocketClosed(int socket) {
 	std::lock_guard<std::mutex> guard(g_mutex);
 	g_bySocket.erase(socket);
 	g_defaultDest.erase(socket);
+	g_selfPeer.erase(socket);
 	g_datagrams.erase(socket);
+	for (auto it = g_selfPorts.begin(); it != g_selfPorts.end(); ) {
+		it = it->second == socket ? g_selfPorts.erase(it) : std::next(it);
+	}
 	for (auto it = g_listeners.begin(); it != g_listeners.end(); ) {
 		it = it->second == socket ? g_listeners.erase(it) : std::next(it);
 	}

@@ -63,6 +63,10 @@ int Connect(int socket, SOCKET *hostSock, bool blocking, u32 dst, u16 dstPort, u
 void SetDefaultDest(int socket, u32 dst, u16 dstPort);
 bool GetDefaultDest(int socket, u32 *dst, u16 *dstPort);
 bool GetPeer(int socket, u32 *addr, u16 *port);
+// connect() to our own vaddr goes over host loopback; these make both ends show the vaddr as the peer.
+void NoteSelfConnect(int socket, u16 localPort, u16 dstPort);
+// accept(): a host loopback connection from peerPort that NoteSelfConnect made. Returns our vaddr for it.
+bool AcceptedFromSelf(int socket, u16 peerPort, u32 *vaddr);
 
 void Listen(int socket, u16 port);
 // A relayed connection queued on this listening socket: its host socket and the peer. The caller adopts it

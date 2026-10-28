@@ -1088,10 +1088,13 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	saddr.addr.sa_family = dst->sa_family;
 	memcpy(saddr.addr.sa_data, dst->sa_data, sizeof(dst->sa_data));
 
+	bool toOwnVaddr = false;
 	if (saddr.addr.sa_family == AF_INET && NpRelay::IsRelayAddr(saddr.in.sin_addr.s_addr)) {
-		if (!NpRelay::IsOwnAddr(saddr.in.sin_addr.s_addr))
+		if (!NpRelay::IsOwnAddr(saddr.in.sin_addr.s_addr) || IsHostDgram(inetSock->sock))
 			return RelayConnect(socket, inetSock, saddr);
-		saddr.in.sin_addr.s_addr = INADDR_ANY;  // our own virtual address: this host, as below
+		// Our own virtual address: this host, as below, over host loopback.
+		saddr.in.sin_addr.s_addr = INADDR_ANY;
+		toOwnVaddr = true;
 	}
 
 	// On the PSP's BSD stack, connecting to INADDR_ANY (0.0.0.0) reaches this host. Windows refuses it, so use
@@ -1123,6 +1126,12 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	}
 	int retval = connect(inetSock->sock, (struct sockaddr*)&saddr.addr, dstlen);
 	int hostErrno = socket_errno;
+	if (toOwnVaddr && (retval == 0 || connectInProgress(hostErrno))) {
+		sockaddr_in local{};
+		socklen_t localLen = sizeof(local);
+		getsockname(inetSock->sock, (sockaddr *)&local, &localLen);
+		NpRelay::NoteSelfConnect(socket, ntohs(local.sin_port), ntohs(saddr.in.sin_port));
+	}
 	if (!inetSock->nonblocking) {
 		// Change the blocking mode back to nonblocking
 		changeBlockingMode(inetSock->sock, 1);
@@ -1212,6 +1221,12 @@ static int sceNetInetAccept(int socket, u32 addrPtr, u32 addrLenPtr) {
 		return hleLogError(Log::sceNet, -1, "Out of socket IDs");;
 	}
 
+	// A connection we made to our own vaddr: the peer is that vaddr, not loopback.
+	u32 ownVaddr;
+	if (saddr.addr.sa_family == AF_INET && (ntohl(saddr.in.sin_addr.s_addr) >> 24) == 127 &&
+		NpRelay::AcceptedFromSelf(newSocketId, ntohs(saddr.in.sin_port), &ownVaddr)) {
+		saddr.in.sin_addr.s_addr = ownVaddr;
+	}
 	if (src) {
 		src->sa_family = saddr.addr.sa_family;
 		memcpy(src->sa_data, saddr.addr.sa_data, sizeof(src->sa_data));
