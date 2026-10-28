@@ -92,6 +92,8 @@ struct NpMatching2CreateJoinRoomParams {
 	u32 maxSlot = 0;
 	u32 flagAttr = 0;
 	std::string password;  // empty = none
+	bool hasPasswordSlotMask = false;
+	u64 passwordSlotMask = 0;  // slot 1 = bit 63 (PS3 order)
 	std::vector<NpMatching2IntAttr> intAttrsExt;
 	std::vector<NpMatching2BinAttr> binAttrsInternal;
 	std::vector<NpMatching2BinAttr> searchBinAttrsExt;
@@ -134,6 +136,13 @@ struct NpMatching2RoomMessageParams {
 	std::vector<u8> payload;
 };
 
+// GetUserInfoList: an online user and the rooms they're in. Users who aren't online are left out.
+struct NpMatching2UserInfo {
+	std::string onlineId;
+	std::vector<u64> roomIds;
+	std::vector<NpMatching2Room> rooms;  // external data of those rooms
+};
+
 // Something the server pushes: a room event (0x1101 MemberJoined ...), a room message (0x2102) or a
 // signaling event (0x5101 Dead / 0x5102 Established).
 struct NpMatching2Event {
@@ -159,6 +168,7 @@ struct NpMatching2Event {
 using NpMatching2Done = std::function<void(int errorCode)>;
 using NpMatching2RoomDone = std::function<void(int errorCode, const NpMatching2Room &room)>;
 using NpMatching2RoomsDone = std::function<void(int errorCode, const std::vector<NpMatching2Room> &rooms, u32 total)>;
+using NpMatching2UsersDone = std::function<void(int errorCode, const std::vector<NpMatching2UserInfo> &users)>;
 
 class NpMatching2Backend {
 public:
@@ -183,6 +193,7 @@ public:
 	virtual void SetRoomDataExternal(const NpMatching2RoomDataExternalParams &params, NpMatching2Done done) = 0;
 	virtual void GetRoomDataExternalList(const std::vector<u64> &roomIds, NpMatching2RoomsDone done) = 0;
 	virtual void SendRoomMessage(const NpMatching2RoomMessageParams &params, NpMatching2Done done) = 0;
+	virtual void GetUserInfoList(u16 serverId, const std::vector<std::string> &onlineIds, int option, NpMatching2UsersDone done) = 0;
 
 	// Called from the callback pump. Returns the next pushed event, if any. A network backend also delivers
 	// its pending `done` calls from here.

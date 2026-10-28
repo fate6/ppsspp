@@ -803,22 +803,6 @@ static int sceNpMatching2AbortRequest(int ctxId, u32 reqId)
 	return hleLogInfo(Log::sceNet, 0);
 }
 
-// Room functions PPSSPP didn't know (names from PSP2i's debug strings). They need a real backend, so for
-// now they fail through the request callback instead of leaving the game waiting.
-static int NpMatching2UnimplementedRequest(const char *name, int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr, u32 event)
-{
-	if (!npMatching2Inited)
-		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
-
-	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, event);
-	NpMatching2FinishRequest(req, SCE_NP_MATCHING2_SERVER_ERROR_SERVICE_UNAVAILABLE);
-	return hleLogError(Log::sceNet, 0, "UNIMPL %s(%d, %08x, %08x, %08x) -> reqId=%d fails with SERVICE_UNAVAILABLE", name, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, req.reqId);
-}
-
-static int sceNpMatching2GetUserInfoList(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
-{
-	return NpMatching2UnimplementedRequest(__FUNCTION__, ctxId, reqParamPtr, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0004);
-}
 
 // PSP SceNpMatching2RoomDataExternal (search results), as PSP2i reads it: next @0, serverId @4, worldId @8,
 // lobbyId @0x10, roomId @0x18, u32 maxSlot @0x20, u32 curMemberNum @0x24, passwordSlotMask @0x28,
@@ -911,6 +895,93 @@ static u32 NpMatching2WriteRoomDataExternalList(NpMatching2SlotWriter &out, cons
 		count++;
 	}
 	return count;
+}
+
+// reqParam (0x18) = PS3 SceNpMatching2GetUserInfoListRequest, as PSP2i's partner-card search (FUN_08cb1f24)
+// fills it: u16 serverId @0, SceNpId *npId @4, u32 npIdNum @8, u16 *attrId @0xC, u32 attrIdNum @0x10,
+// int option @0x14 (1). The callback data is {SceNpMatching2UserInfo *userInfo; u32 userInfoNum;
+// SceNpMatching2RoomDataExternal *rooms; u32 roomNum}. UserInfo (0x40): next @0, SceNpUserInfo2 @4 (SceNpId,
+// onlineName* @0x28, avatarUrl* @0x2C), userBinAttr @0x30/0x34, joinedSessionInfo @0x38/0x3C. PSP2i
+// (searchRoomByNpIdCb FUN_08cb455c) reads only the first user's joinedSessionInfo and passes
+// joinedSessionInfo + 0x10 (the roomId) to GetRoomDataExternalList.
+static const u32 NP_MATCHING2_USER_INFO_SIZE = 0x40;
+// JoinedSessionInfo (0x20): u8 sessionType @0 (2 = room), u16 serverId @2, u32 worldId @4, lobbyId @8,
+// roomId @0x10, joinDate @0x18.
+static const u32 NP_MATCHING2_JOINED_SESSION_INFO_SIZE = 0x20;
+
+static int sceNpMatching2GetUserInfoList(int ctxId, u32 reqParamPtr, u32 optParamPtr, u32 assignedReqIdPtr)
+{
+	if (!npMatching2Inited)
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_NOT_INITIALIZED);
+	if (!Memory::IsValidRange(reqParamPtr, 0x18) || !Memory::IsValidRange(assignedReqIdPtr, 4))
+		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT);
+
+	const u16 serverId = Memory::Read_U16(reqParamPtr);
+	const u32 npIds = Memory::Read_U32(reqParamPtr + 0x04), npIdNum = Memory::Read_U32(reqParamPtr + 0x08);
+	const int option = (int)Memory::Read_U32(reqParamPtr + 0x14);
+	std::vector<std::string> onlineIds;
+	if (npIds && npIdNum <= NP_MATCHING2_MAX_ATTRS && Memory::IsValidRange(npIds, npIdNum * 36)) {
+		for (u32 i = 0; i < npIdNum; i++) {
+			// SceNpId starts with SceNpOnlineId {char data[16]; char term; ...}.
+			const char *id = (const char *)Memory::GetPointer(npIds + i * 36);
+			onlineIds.push_back(std::string(id, strnlen(id, 16)));
+		}
+	}
+
+	const NpMatching2PendingRequest req = NpMatching2BeginRequest(ctxId, optParamPtr, assignedReqIdPtr, PSP_NP_MATCHING2_EVENT_0004);
+	GetNpMatching2Backend().GetUserInfoList(serverId, onlineIds, option, [req](int err, const std::vector<NpMatching2UserInfo> &users) {
+		INFO_LOG(Log::sceNet, "NpMatching2 GetUserInfoList reqId=%d -> %d online user(s)%s%s, error=%08x", req.reqId, (int)users.size(),
+			users.empty() ? "" : ", first ", users.empty() ? "" : users[0].onlineId.c_str(), err);
+		NpMatching2FinishRequest(req, err, [users](u32 data, s32 err) -> s32 {
+			NpMatching2SlotWriter out{ data + 0x10, data + NP_MATCHING2_DATA_SLOT_SIZE };
+			u32 firstUser = 0, prevUser = 0, userCount = 0;
+			std::vector<NpMatching2Room> rooms;
+			for (const NpMatching2UserInfo &user : users) {
+				NpMatching2SlotWriter attempt = out;
+				const u32 u = attempt.Alloc(NP_MATCHING2_USER_INFO_SIZE);
+				const u32 sessions = user.roomIds.empty() ? 0 : attempt.Alloc((u32)user.roomIds.size() * NP_MATCHING2_JOINED_SESSION_INFO_SIZE);
+				if (!u || (!user.roomIds.empty() && !sessions)) {
+					WARN_LOG(Log::sceNet, "NpMatching2: only %u of %u users fit in the callback data", userCount, (u32)users.size());
+					break;
+				}
+				out = attempt;
+				Memory::Memset(u, 0, NP_MATCHING2_USER_INFO_SIZE, "NpMatching2UserInfo");
+				Memory::Memcpy(u + 4, user.onlineId.data(), (u32)std::min(user.onlineId.size(), (size_t)16), "NpMatching2UserInfo");
+				Memory::Write_U32(u + 4, u + 0x28);  // onlineName -> the handle inside the SceNpId
+				for (size_t i = 0; i < user.roomIds.size(); i++) {
+					const u32 s = sessions + (u32)i * NP_MATCHING2_JOINED_SESSION_INFO_SIZE;
+					Memory::Memset(s, 0, NP_MATCHING2_JOINED_SESSION_INFO_SIZE, "NpMatching2JoinedSessionInfo");
+					Memory::Write_U8(2, s);  // room
+					for (const NpMatching2Room &room : user.rooms) {
+						if (room.roomId == user.roomIds[i]) {
+							Memory::Write_U16(room.serverId, s + 0x02);
+							Memory::Write_U32(room.worldId, s + 0x04);
+							Memory::Write_U64(room.lobbyId, s + 0x08);
+						}
+					}
+					Memory::Write_U64(user.roomIds[i], s + 0x10);
+				}
+				Memory::Write_U32(sessions, u + 0x38);
+				Memory::Write_U32((u32)user.roomIds.size(), u + 0x3C);
+				if (prevUser)
+					Memory::Write_U32(u, prevUser);
+				else
+					firstUser = u;
+				prevUser = u;
+				userCount++;
+				rooms.insert(rooms.end(), user.rooms.begin(), user.rooms.end());
+			}
+			u32 firstRoom = 0;
+			const u32 roomCount = NpMatching2WriteRoomDataExternalList(out, rooms, &firstRoom);
+			Memory::Write_U32(firstUser, data);
+			Memory::Write_U32(userCount, data + 4);
+			Memory::Write_U32(firstRoom, data + 8);
+			Memory::Write_U32(roomCount, data + 12);
+			return err;
+		});
+	});
+	return hleLogInfo(Log::sceNet, 0, "serverId=%d, %d npId(s)%s%s, option=%d -> reqId=%d", serverId, (int)onlineIds.size(),
+		onlineIds.empty() ? "" : ", first ", onlineIds.empty() ? "" : onlineIds[0].c_str(), option, req.reqId);
 }
 
 // Remembers the room we're now in, with its per-room callbacks.
@@ -1101,6 +1172,12 @@ static int sceNpMatching2CreateJoinRoom(int ctxId, u32 reqParamPtr, u32 optParam
 	params.searchBinAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x28), Memory::Read_U32(reqParamPtr + 0x2C));
 	params.binAttrsExt = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x30), Memory::Read_U32(reqParamPtr + 0x34));
 	params.password = NpMatching2ReadPassword(Memory::Read_U32(reqParamPtr + 0x38));
+	// u64 *passwordSlotMask @0x44: PSP2i sets it with a password, one bit per slot (FUN_08cb00f4).
+	const u32 maskPtr = Memory::Read_U32(reqParamPtr + 0x44);
+	if (maskPtr && Memory::IsValidRange(maskPtr, 8)) {
+		params.hasPasswordSlotMask = true;
+		params.passwordSlotMask = Memory::Read_U64(maskPtr);
+	}
 	params.memberBinAttrsInternal = NpMatching2ReadBinAttrs(Memory::Read_U32(reqParamPtr + 0x5C), Memory::Read_U32(reqParamPtr + 0x60));
 	if (params.worldId == 0)
 		return hleLogError(Log::sceNet, SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT, "worldId 0");
@@ -1114,9 +1191,10 @@ static int sceNpMatching2CreateJoinRoom(int ctxId, u32 reqParamPtr, u32 optParam
 		INFO_LOG(Log::sceNet, "NpMatching2 CreateJoinRoom reqId=%d -> roomId=%llu, error=%08x", req.reqId, (unsigned long long)room.roomId, err);
 		NpMatching2FinishRoomRequest(req, err, room);
 	});
-	return hleLogInfo(Log::sceNet, 0, "world=%u maxSlot=%u flagAttr=%08x attrs %d/%d/%d/%d%s -> reqId=%d",
+	return hleLogInfo(Log::sceNet, 0, "world=%u maxSlot=%u flagAttr=%08x attrs %d/%d/%d/%d%s (slot mask %016llx) -> reqId=%d",
 		params.worldId, params.maxSlot, params.flagAttr, (int)params.intAttrsExt.size(), (int)params.binAttrsInternal.size(),
-		(int)params.searchBinAttrsExt.size(), (int)params.binAttrsExt.size(), params.password.empty() ? "" : ", password", req.reqId);
+		(int)params.searchBinAttrsExt.size(), (int)params.binAttrsExt.size(), params.password.empty() ? "" : ", password",
+		(unsigned long long)params.passwordSlotMask, req.reqId);
 }
 
 // Same arguments as CreateJoinRoom (PSP2i call site). reqParam (0x30) = PS3 SceNpMatching2JoinRoomRequest:

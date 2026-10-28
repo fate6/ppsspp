@@ -137,6 +137,11 @@ public:
 		done(InRoom(params.roomId));
 	}
 
+	void GetUserInfoList(u16 serverId, const std::vector<std::string> &onlineIds, int option, NpMatching2UsersDone done) override {
+		// Nobody else is online.
+		done(0, {});
+	}
+
 	bool PollEvent(NpMatching2Event *event) override {
 		return false;
 	}
@@ -463,6 +468,8 @@ public:
 		w.writeUint("flagAttr", params.flagAttr);
 		if (!params.password.empty())
 			w.writeString("password", params.password);
+		if (params.hasPasswordSlotMask)
+			WriteU64(w, "passwordSlotMask", params.passwordSlotMask);
 		WriteIntAttrs(w, "intAttrsExt", params.intAttrsExt);
 		WriteBinAttrs(w, "binAttrsInternal", params.binAttrsInternal);
 		WriteBinAttrs(w, "searchBinAttrsExt", params.searchBinAttrsExt);
@@ -547,6 +554,38 @@ public:
 				});
 			}
 			done(err, rooms, (u32)rooms.size());
+		});
+	}
+
+	void GetUserInfoList(u16 serverId, const std::vector<std::string> &onlineIds, int option, NpMatching2UsersDone done) override {
+		json::JsonWriter w;
+		w.begin();
+		w.writeUint("serverId", serverId);
+		w.pushArray("onlineIds");
+		for (const std::string &id : onlineIds)
+			w.writeString(id);
+		w.pop();
+		w.writeInt("option", option);
+		w.end();
+		Request(MSG_GET_USER_INFO_LIST, w.str(), [done](int err, const json::JsonGet &body) {
+			std::vector<NpMatching2UserInfo> users;
+			if (err >= 0) {
+				JsonForEach(body, "users", [&](const json::JsonGet &u) {
+					NpMatching2UserInfo user;
+					user.onlineId = JsonStr(u, "onlineId");
+					if (const JsonNode *ids = u.getArray("roomIds")) {
+						for (const JsonNode *id : ids->value) {
+							if (id->value.getTag() == JSON_NUMBER)
+								user.roomIds.push_back((u64)(s64)id->value.toNumber());
+						}
+					}
+					JsonForEach(u, "rooms", [&](const json::JsonGet &r) {
+						user.rooms.push_back(JsonRoomExternal(r));
+					});
+					users.push_back(std::move(user));
+				});
+			}
+			done(err, users);
 		});
 	}
 
