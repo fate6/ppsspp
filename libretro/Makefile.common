@@ -845,6 +845,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/HLE/sceNp.cpp \
 	       $(COREDIR)/HLE/sceNp2.cpp \
 	       $(COREDIR)/HLE/NpMatching2Backend.cpp \
+	       $(COREDIR)/HLE/NpRelay.cpp \
 	       $(COREDIR)/HLE/scePauth.cpp \
 	       $(COREDIR)/HLE/sceUsbGps.cpp \
 	       $(COREDIR)/HW/BufferQueue.cpp \
