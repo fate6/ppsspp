@@ -89,6 +89,9 @@ jobs:
         cp *.pdb ppsspp/
         cp Windows/*.bat ppsspp/
         cp -r assets ppsspp/assets
+        # PSP2i fork: the game's online settings, in the portable memstick next to the exe.
+        mkdir ppsspp/memstick/PSP/SYSTEM
+        cp psp2i/NPJH50332_ppsspp.ini ppsspp/memstick/PSP/SYSTEM/
 
     - name: Package headless (non-Win32)
       if: matrix.platform != 'Win32'
@@ -113,12 +116,16 @@ jobs:
         rm ppsspp/*.pdb
         mkdir releases
         Compress-Archive -Path "ppsspp/*" -Update -DestinationPath "releases/PPSSPP-${{ github.ref_name }}-Windows-${{ matrix.platform }}.zip"
+        # PSP2i fork: the game ini on its own too, for the other platforms (once, from x64).
+        if ('${{ matrix.platform }}' -eq 'x64') { cp psp2i/NPJH50332_ppsspp.ini releases/ }
 
     - name: Upload release
       uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
       if: github.ref_type == 'tag'
       with:
-        files: releases/*.zip
+        files: |
+          releases/*.zip
+          releases/*.ini
 
   build-uwp:
     runs-on: windows-latest

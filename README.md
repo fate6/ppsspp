@@ -47,10 +47,19 @@ is at [hrydgard/ppsspp](https://github.com/hrydgard/ppsspp), and its README foll
 Upstream leaves `sceNpMatching2` disabled because of softlocks in Patapon 3. Other games that use Matching2
 may behave differently on this fork.
 
-### Builds
+### Builds and setup
 
-GitHub Actions builds Windows and Linux (AppImage) on every push to `psp2i` (see the Actions tab). Tester
-releases come later. No game files are included: you need your own copy of the game.
+Tester builds are on the Releases page. GitHub Actions also builds Windows and Linux (AppImage) on every
+push to `psp2i` (see the Actions tab). No game files are included: you need your own copy of the game.
+
+The game's online settings are in [`psp2i/NPJH50332_ppsspp.ini`](psp2i/NPJH50332_ppsspp.ini):
+
+- **Windows:** the release zip already has the file at `memstick/PSP/SYSTEM/` next to the exe.
+- **Linux AppImage and other platforms:** download `NPJH50332_ppsspp.ini` from the release and put it in
+  `PSP/SYSTEM/` in your memory stick folder. On Linux that is `~/.config/ppsspp/PSP/SYSTEM/`.
+
+In PPSSPP, set your username and Infinity License under Settings → Networking. The server's address in the
+ini is still a placeholder (`psp2i-server.invalid`) until the server goes public.
 
 ---
 
