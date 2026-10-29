@@ -1,3 +1,59 @@
+PPSSPP for Phantasy Star Portable 2 Infinity (`psp2i` branch)
+==============================================================
+
+This is a fork of PPSSPP v1.20.4 that brings back the online mode of *Phantasy Star Portable 2 Infinity*
+(NPJH50332). The game went online through PSN Matching2 and SEGA's servers, and both are gone. With this fork
+the game talks to a community server instead. Everything below is specific to the fork. The official PPSSPP
+is at [hrydgard/ppsspp](https://github.com/hrydgard/ppsspp), and its README follows this section.
+
+### What the fork adds
+
+**Online play (PSN Matching2)**
+
+- `sceNpMatching2` is registered and implemented, and talks to a matching server over TCP (`[Network]
+  NpMatching2Server = host:port`). That covers request callbacks, server and world lists, rooms (create,
+  join, leave, search, kick, room data), room messages, user search and signaling. With no server set, a
+  local offline backend gives you a solo lobby.
+- **Relay:** peer traffic between players (lobby TCP, P2P UDP) can go through the matching server. Players
+  behind CGNAT or without port forwarding can then still play together. `[Network] NpRelay` turns it on
+  (on by default).
+- **Hosts overrides:** a per-game hosts list maps the game's hostnames to a server, so you don't need a DNS
+  server. Turn on Settings → Networking → Infrastructure → "Use hosts overrides", then open "Hosts
+  overrides...".
+- **PSN functions the game needs:**
+  - the PSN sign-in dialog (it shows no UI) and sign-in refresh;
+  - `sceNpCommerce2Init/Term` and `sceHttpsEnableOption`.
+- **NP ticket:** carries a device ID made once per install, plus an optional license code. In Settings →
+  Networking the code is labeled "Infinity License" for this game.
+
+**sceNetInet fixes**
+
+- `connect()` to 0.0.0.0 reaches this host, as on a real PSP.
+- The PSP's P2P socket type and its socket options are accepted.
+- `[Network] LoopbackLatencyVblanks` (default 6) holds back same-host TCP data for a few frames. This fixes
+  the mission counter when you host a party.
+- `[Network] NpLoopbackHost = 127.0.0.<n>` runs several instances on one PC.
+- `[Network] NpP2PTrace` logs P2P traffic.
+
+**Other changes**
+
+- Every install saves its own ini, even while another PPSSPP instance runs. Upstream lets only the first
+  instance save.
+- Linux/SDL portable mode: a `memstick` folder next to the binary is used as the memory stick.
+- Unknown syscalls log their module, NID and caller.
+- Debugger WebSocket: log events reach every client, and a long-lived log stream no longer goes stale.
+- `Tools/deck`: a portable Linux x86_64 build for the Steam Deck, made in Docker.
+
+Upstream leaves `sceNpMatching2` disabled because of softlocks in Patapon 3. Other games that use Matching2
+may behave differently on this fork.
+
+### Builds
+
+GitHub Actions builds Windows and Linux (AppImage) on every push to `psp2i` (see the Actions tab). Tester
+releases come later. No game files are included: you need your own copy of the game.
+
+---
+
 PPSSPP - a fast and portable PSP emulator
 =========================================
 
