@@ -4,6 +4,8 @@ on:
   push:
     branches:
     - master
+    # PSP2i fork: tester builds.
+    - psp2i
     # For testing.
     - actions
     tags:
